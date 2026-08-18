@@ -1,0 +1,45 @@
+{
+  "expo": {
+    "name": "GEM",
+    "slug": "gem",
+    "scheme": "gem",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "backgroundColor": "#0B0B12"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "android": {
+      "package": "com.gem.buildstudio",
+      "permissions": [
+        "POST_NOTIFICATIONS",
+        "RECEIVE_BOOT_COMPLETED",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_DATA_SYNC"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#6C5CE7"
+        }
+      ],
+      [
+        "expo-document-picker",
+        {
+          "iCloudContainerEnvironment": "Production"
+        }
+      ]
+    ],
+    "extra": {
+      "GITHUB_TOKEN": "REPLACE_WITH_GT_TOKEN",
+      "GITHUB_OWNER": "segz7448",
+      "GITHUB_REPO": "GEM",
+      "GITHUB_BASE_BRANCH": "main"
+    }
+  }
+}
