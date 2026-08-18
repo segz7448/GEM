@@ -59,6 +59,51 @@ export interface PushFile {
   contentBase64?: string;
 }
 
+export async function getFileSha(branchName: string, path: string): Promise<string | null> {
+  try {
+    const data = await gh<{ sha: string }>(`/repos/${OWNER}/${REPO}/contents/${path}?ref=${branchName}`);
+    return data.sha;
+  } catch {
+    return null;
+  }
+}
+
+export async function putFile(branchName: string, path: string, content: string, message: string, existingSha: string | null): Promise<void> {
+  await gh(`/repos/${OWNER}/${REPO}/contents/${path}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      message,
+      content: base64Encode(content),
+      branch: branchName,
+      ...(existingSha ? { sha: existingSha } : {}),
+    }),
+  });
+}
+
+function base64Encode(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+/**
+ * GitHub only recognizes a workflow_dispatch-triggered workflow as
+ * dispatchable via the API if the file exists on the repo's DEFAULT
+ * branch — dispatching against a temp branch alone (which is all the
+ * per-build pipeline normally pushes) 404s with "workflow not found"
+ * even though that branch has the file. This checks the base branch
+ * once and self-heals by committing directly to it if missing.
+ * Content on the base branch only needs the right trigger/inputs to
+ * register the workflow_id — the actual steps that run for a given
+ * build always come from what's pushed to that build's own branch.
+ */
+export async function ensureWorkflowRegistered(path: string, content: string): Promise<void> {
+  const existingSha = await getFileSha(BASE_BRANCH, path);
+  if (existingSha) return; // already registered — nothing to do
+  await putFile(BASE_BRANCH, path, content, 'GEM: register build workflow on default branch', null);
+}
+
 export async function getBaseBranchSha(): Promise<string> {
   const data = await gh<{ object: { sha: string } }>(`/repos/${OWNER}/${REPO}/git/ref/heads/${BASE_BRANCH}`);
   return data.object.sha;

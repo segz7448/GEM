@@ -142,6 +142,11 @@ async function runPipeline(buildId: string): Promise<void> {
     const pushFiles = files.map((f) => (f.isBinary ? { path: f.path, contentBase64: f.base64! } : { path: f.path, content: f.text! }));
     pushFiles.push({ path: WORKFLOW_PATH, content: workflowYaml });
 
+    // Self-healing registration — see ensureWorkflowRegistered's comment
+    // for why this has to happen against the base branch specifically,
+    // not just the per-build branch pushed below.
+    await gh.ensureWorkflowRegistered(WORKFLOW_PATH, workflowYaml);
+
     // ---- Branch: reuse if a prior attempt already created it ---------
     setStage(buildId, appName, 'uploading', 'pushing_to_build_branch');
     const branchName = build.branchName ?? `build/${buildId}`;

@@ -31,6 +31,16 @@ Actions enabled. `GT_TOKEN_KEY` (admin) is intentionally **not**
 referenced anywhere in this app — nothing in the pipeline needs
 elevated scope, so it stays out entirely.
 
+**First build only:** GEM checks whether `.github/workflows/gem-android.yml`
+already exists on your base branch, and if not, commits it there
+directly (`githubClient.ts` → `ensureWorkflowRegistered`) before doing
+anything else. This is required, not optional — GitHub only treats a
+`workflow_dispatch` workflow as dispatchable via the API once it
+exists on the *default* branch specifically; a per-build temp branch
+having the file isn't enough on its own. So expect one extra commit
+to land on your base branch the first time you run a build. After
+that it's a no-op check on every subsequent build.
+
 ## How a build actually runs (all on-device, `src/lib/buildPipeline.ts`)
 
 1. `expo-document-picker` → zip picked, immediately copied to durable
