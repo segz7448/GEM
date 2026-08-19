@@ -33,7 +33,7 @@ class GemForegroundServiceModule : Module() {
     }
 
     Function("stop") {
-      val context = appContext.reactContext ?: return@Function
+      val context = appContext.reactContext ?: return@Function null
       context.stopService(Intent(context, BuildKeepAliveService::class.java))
     }
   }
