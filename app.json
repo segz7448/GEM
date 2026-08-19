@@ -37,7 +37,7 @@
       "./plugins/withReleaseSigning"
     ],
     "extra": {
-      "GITHUB_TOKEN": "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",
+      "GITHUB_TOKEN": "REPLACE_WITH_GT_TOKEN",
       "GITHUB_OWNER": "segz7448",
       "GITHUB_REPO": "GEM",
       "GITHUB_BASE_BRANCH": "main"

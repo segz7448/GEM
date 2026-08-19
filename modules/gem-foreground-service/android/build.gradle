@@ -10,12 +10,15 @@ applyKotlinExpoModulesCorePlugin()
 useCoreDependencies()
 useExpoPublishing()
 
+// useDefaultAndroidSdkVersions() opens its own `android {}` block internally
+// and sets compileSdkVersion/minSdkVersion/targetSdkVersion from the root
+// project's ext values (or sane defaults) - it must be called instead of
+// referencing getExpoDefaultMinSdkVersion()/getExpoDefaultTargetSdkVersion(),
+// which don't exist on this expo-modules-core version.
+useDefaultAndroidSdkVersions()
+
 android {
   namespace "expo.modules.gemforegroundservice"
-  defaultConfig {
-    minSdkVersion getExpoDefaultMinSdkVersion(project)
-    targetSdkVersion getExpoDefaultTargetSdkVersion(project)
-  }
 }
 
 dependencies {
