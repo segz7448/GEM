@@ -34,7 +34,8 @@
           "iCloudContainerEnvironment": "Production"
         }
       ],
-      "./plugins/withReleaseSigning"
+      "./plugins/withReleaseSigning",
+      "./plugins/withGradleMemoryFix"
     ],
     "extra": {
       "GITHUB_TOKEN": "REPLACE_WITH_GT_TOKEN",
