@@ -69,6 +69,121 @@ export async function extractTextFromLogZip(zipBase64: string): Promise<string> 
   return parts.join('\n\n');
 }
 
+const TEMP_ZIP_DIR = `${FileSystem.documentDirectory}temp-picked-zips/`;
+
+async function writeZipToTemp(zip: JSZip, fileName: string): Promise<string> {
+  await FileSystem.makeDirectoryAsync(TEMP_ZIP_DIR, { intermediates: true }).catch(() => undefined);
+  const base64 = await zip.generateAsync({ type: 'base64' });
+  const uri = `${TEMP_ZIP_DIR}${Date.now()}-${fileName}`;
+  await FileSystem.writeAsStringAsync(uri, base64, { encoding: FileSystem.EncodingType.Base64 });
+  return uri;
+}
+
+/**
+ * Builds a zip from a flat list of individually-picked files (expo-document-picker
+ * `multiple: true`). No folder structure is implied by this picker, so every file
+ * lands at the zip root — matches what "Choose Files" means in the upload UI.
+ */
+export async function zipPickedFiles(files: { uri: string; name: string }[], zipName: string): Promise<string> {
+  const zip = new JSZip();
+  for (const file of files) {
+    const base64 = await FileSystem.readAsStringAsync(file.uri, { encoding: FileSystem.EncodingType.Base64 });
+    zip.file(file.name, base64, { base64: true });
+  }
+  return writeZipToTemp(zip, zipName.endsWith('.zip') ? zipName : `${zipName}.zip`);
+}
+
+/**
+ * Recursively walks an Android Storage Access Framework directory tree (from
+ * `StorageAccessFramework.requestDirectoryPermissionsAsync`) and zips it, preserving
+ * the folder's internal structure — matches what "Choose Folder" means in the upload UI.
+ * Android-only; SAF has no equivalent directory-tree API on iOS.
+ */
+export async function zipPickedDirectory(rootDirUri: string, folderName: string): Promise<string> {
+  const SAF = FileSystem.StorageAccessFramework;
+  const zip = new JSZip();
+
+  const rootDocId = decodeURIComponent(rootDirUri.split('/document/')[1] ?? '');
+
+  async function walk(dirUri: string) {
+    const children = await SAF.readDirectoryAsync(dirUri);
+    for (const childUri of children) {
+      const childDocId = decodeURIComponent(childUri.split('/document/')[1] ?? '');
+      const relPath = childDocId.startsWith(`${rootDocId}/`) ? childDocId.slice(rootDocId.length + 1) : childDocId;
+      if (!relPath || relPath.includes('__MACOSX') || relPath.includes('/.git/') || relPath.startsWith('.git/')) continue;
+
+      // SAF has no cheap "is this a directory" flag — the reliable way is to try
+      // listing it as a directory; a file rejects, a directory succeeds.
+      let isDir = true;
+      let grandChildren: string[] = [];
+      try {
+        grandChildren = await SAF.readDirectoryAsync(childUri);
+      } catch {
+        isDir = false;
+      }
+
+      if (isDir) {
+        await walk(childUri);
+        void grandChildren; // already consumed via the recursive walk
+      } else {
+        const binary = isBinaryPath(relPath);
+        const content = await FileSystem.readAsStringAsync(childUri, { encoding: FileSystem.EncodingType.Base64 });
+        if (binary) {
+          zip.file(relPath, content, { base64: true });
+        } else {
+          // Decode back to text so non-binary files store as UTF-8 in the zip, matching extractUploadZip's expectations.
+          const bytes = Uint8Array.from(atobPolyfill(content), (c) => c.charCodeAt(0));
+          zip.file(relPath, bytesToUtf8(bytes));
+        }
+      }
+    }
+  }
+
+  await walk(rootDirUri);
+  return writeZipToTemp(zip, `${folderName}.zip`);
+}
+
+const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/** Minimal base64 decoder (mirrors githubClient.ts's encoder) — avoids relying on `atob` being present in Hermes. */
+function atobPolyfill(b64: string): string {
+  const clean = b64.replace(/=+$/, '');
+  let bits = '';
+  for (const ch of clean) {
+    const idx = B64_CHARS.indexOf(ch);
+    if (idx === -1) continue;
+    bits += idx.toString(2).padStart(6, '0');
+  }
+  let out = '';
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    out += String.fromCharCode(parseInt(bits.slice(i, i + 8), 2));
+  }
+  return out;
+}
+
+function bytesToUtf8(bytes: Uint8Array): string {
+  let result = '';
+  let i = 0;
+  while (i < bytes.length) {
+    const b0 = bytes[i];
+    if (b0 < 0x80) {
+      result += String.fromCharCode(b0);
+      i += 1;
+    } else if ((b0 & 0xe0) === 0xc0) {
+      result += String.fromCharCode(((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f));
+      i += 2;
+    } else if ((b0 & 0xf0) === 0xe0) {
+      result += String.fromCharCode(((b0 & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f));
+      i += 3;
+    } else {
+      const cp = ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+      result += String.fromCodePoint(cp);
+      i += 4;
+    }
+  }
+  return result;
+}
+
 /** Saves an extracted app icon into app-private storage and returns its local file URI. */
 export async function saveIconLocally(buildId: string, base64: string, mimeType: string): Promise<string> {
   const ext = mimeType === 'image/jpeg' ? 'jpg' : mimeType === 'image/webp' ? 'webp' : 'png';
