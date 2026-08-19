@@ -93,6 +93,42 @@ function reactNativeAndroid(): string {
   );
 }
 
+function expoManagedAndroid(): string {
+  return (
+    header() +
+    `
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Align Expo package versions with SDK
+        # Catches mismatched expo-* module versions (compiles fine,
+        # throws NoSuchMethodError/NoClassDefFoundError against
+        # expo-modules-core at runtime instead) before they reach a build.
+        run: npx expo install --fix
+
+      - name: Prebuild native Android project
+        # Generates android/ from app.json + config plugins. Runs
+        # entirely locally on the runner - no Expo account, token, or
+        # cloud service involved.
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x android/gradlew
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug --stacktrace
+` +
+    uploadStep()
+  );
+}
+
 function flutterAndroid(): string {
   return (
     header() +
@@ -114,6 +150,8 @@ function flutterAndroid(): string {
 
 export function generateWorkflow(type: ProjectType): string {
   switch (type) {
+    case 'expo-managed':
+      return expoManagedAndroid();
     case 'react-native':
       return reactNativeAndroid();
     case 'flutter':

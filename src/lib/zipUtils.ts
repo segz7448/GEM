@@ -69,6 +69,16 @@ export async function extractTextFromLogZip(zipBase64: string): Promise<string> 
   return parts.join('\n\n');
 }
 
+/** Saves an extracted app icon into app-private storage and returns its local file URI. */
+export async function saveIconLocally(buildId: string, base64: string, mimeType: string): Promise<string> {
+  const ext = mimeType === 'image/jpeg' ? 'jpg' : mimeType === 'image/webp' ? 'webp' : 'png';
+  const dir = `${FileSystem.documentDirectory}icons/`;
+  await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => undefined);
+  const uri = `${dir}${buildId}.${ext}`;
+  await FileSystem.writeAsStringAsync(uri, base64, { encoding: FileSystem.EncodingType.Base64 });
+  return uri;
+}
+
 /** Saves a base64 APK payload into app-private storage and returns its local file URI. */
 export async function saveApkLocally(buildId: string, fileName: string, base64: string): Promise<{ uri: string; sizeBytes: number }> {
   const dir = `${FileSystem.documentDirectory}apks/`;

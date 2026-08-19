@@ -1,4 +1,4 @@
-import { View, Text, Pressable, FlatList, RefreshControl } from 'react-native';
+import { View, Text, Pressable, FlatList, RefreshControl, Image } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useEffect, useState, useCallback } from 'react';
 import { useFocusEffect } from 'expo-router';
@@ -57,9 +57,18 @@ export default function HomeScreen() {
         keyExtractor={(b) => b.id}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={async () => { setRefreshing(true); await load(); setRefreshing(false); }} />}
         renderItem={({ item }) => (
-          <Pressable onPress={() => router.push(`/build/${item.id}`)} className="bg-surface rounded-xl p-3 mb-2">
-            <Text className="text-white font-medium">{item.appName || 'Untitled build'}</Text>
-            <Text className="text-gray-400 text-sm">{item.status} · {new Date(item.createdAt).toLocaleString()}</Text>
+          <Pressable onPress={() => router.push(`/build/${item.id}`)} className="bg-surface rounded-xl p-3 mb-2 flex-row items-center">
+            {item.appIconPath ? (
+              <Image source={{ uri: item.appIconPath }} style={{ width: 36, height: 36, borderRadius: 8, marginRight: 12 }} />
+            ) : (
+              <View className="w-9 h-9 rounded-lg bg-base mr-3 items-center justify-center">
+                <Text className="text-gray-600">📦</Text>
+              </View>
+            )}
+            <View className="flex-1">
+              <Text className="text-white font-medium">{item.appName || 'Untitled build'}</Text>
+              <Text className="text-gray-400 text-sm">{item.status} · {new Date(item.createdAt).toLocaleString()}</Text>
+            </View>
           </Pressable>
         )}
         ListEmptyComponent={<Text className="text-gray-500">No builds yet — upload a project to get started.</Text>}

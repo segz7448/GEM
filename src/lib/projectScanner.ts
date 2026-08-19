@@ -5,6 +5,7 @@ export type ProjectType =
   | 'android-native-java'
   | 'flutter'
   | 'react-native'
+  | 'expo-managed'
   | 'capacitor'
   | 'cordova'
   | 'unknown';
@@ -36,12 +37,16 @@ export function scanProject(files: ProjectFile[]): ScanResult {
   const hasPackageJson = has((p) => /(^|\/)package\.json$/.test(p));
   const hasCapacitorConfig = has((p) => /capacitor\.config\.(json|ts)$/.test(p));
   const hasCordovaConfig = has((p) => /(^|\/)config\.xml$/.test(p)) && has((p) => /(^|\/)platforms\//.test(p) || /(^|\/)www\//.test(p));
+  const hasCommittedAndroidProject = has((p) => /(^|\/)android\/app\/build\.gradle(\.kts)?$/.test(p));
+  const hasAppJson = has((p) => /^app\.json$/.test(p) || /^app\.config\.(js|ts)$/.test(p));
+  const hasExpoDependency = files.some((f) => f.path === 'package.json' && f.text && /"expo"\s*:/.test(f.text));
 
   let type: ProjectType = 'unknown';
   if (hasPubspec) type = 'flutter';
   else if (hasCapacitorConfig) type = 'capacitor';
   else if (hasCordovaConfig) type = 'cordova';
-  else if (hasPackageJson && has((p) => /(^|\/)android\/app\/build\.gradle$/.test(p))) type = 'react-native';
+  else if (hasPackageJson && hasCommittedAndroidProject) type = 'react-native';
+  else if (hasPackageJson && hasAppJson && hasExpoDependency) type = 'expo-managed';
   else if (hasGradle && hasManifest) type = hasKotlin ? 'android-native-kotlin' : 'android-native-java';
 
   const issues: ScanIssue[] = [];
@@ -99,6 +104,23 @@ export function extractAppMeta(files: ProjectFile[]): { packageName: string | nu
       result.versionName = result.versionName ?? gradle.text.match(/versionName[\s=]+["']([^"']+)["']/)?.[1] ?? null;
       const vc = gradle.text.match(/versionCode[\s=]+(\d+)/)?.[1];
       result.versionCode = result.versionCode ?? (vc ? parseInt(vc, 10) : null);
+    }
+  }
+
+  // Managed Expo projects have no AndroidManifest.xml/build.gradle at
+  // all pre-prebuild — app.json is the only source of this metadata.
+  if (!result.packageName || !result.versionName) {
+    const appJson = files.find((f) => f.path === 'app.json' && f.text);
+    if (appJson?.text) {
+      try {
+        const parsed = JSON.parse(appJson.text);
+        result.packageName = result.packageName ?? parsed?.expo?.android?.package ?? null;
+        result.versionName = result.versionName ?? parsed?.expo?.version ?? null;
+        const vc = parsed?.expo?.android?.versionCode;
+        result.versionCode = result.versionCode ?? (typeof vc === 'number' ? vc : null);
+      } catch {
+        // Malformed app.json — leave whatever was already found from other sources.
+      }
     }
   }
   return result;

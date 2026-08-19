@@ -27,6 +27,7 @@ export interface LocalBuild {
   dispatchTime: string | null;
   githubRunId: number | null;
   uploadZipPath: string | null;
+  appIconPath: string | null;
   apkSizeBytes: number | null;
   apkLocalPath: string | null;
   durationMs: number | null;
@@ -58,6 +59,7 @@ async function getDb(): Promise<SQLite.SQLiteDatabase> {
       dispatchTime TEXT,
       githubRunId INTEGER,
       uploadZipPath TEXT,
+      appIconPath TEXT,
       apkSizeBytes INTEGER,
       apkLocalPath TEXT,
       durationMs INTEGER,
@@ -70,7 +72,7 @@ async function getDb(): Promise<SQLite.SQLiteDatabase> {
   `);
   // Lightweight migration for installs created before these columns
   // existed — CREATE TABLE IF NOT EXISTS won't add them retroactively.
-  for (const col of ['branchName TEXT', 'dispatchTime TEXT', 'githubRunId INTEGER', 'uploadZipPath TEXT']) {
+  for (const col of ['branchName TEXT', 'dispatchTime TEXT', 'githubRunId INTEGER', 'uploadZipPath TEXT', 'appIconPath TEXT']) {
     await dbInstance.execAsync(`ALTER TABLE builds ADD COLUMN ${col};`).catch(() => undefined);
   }
   return dbInstance;
@@ -89,13 +91,13 @@ export async function upsertBuild(build: LocalBuild): Promise<void> {
   await db.runAsync(
     `INSERT INTO builds
       (id, appName, packageName, versionName, versionCode, status, stage, branchName, dispatchTime, githubRunId,
-       uploadZipPath, apkSizeBytes, apkLocalPath, durationMs, scanIssues, failureReport, errorMessage, createdAt, completedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       uploadZipPath, appIconPath, apkSizeBytes, apkLocalPath, durationMs, scanIssues, failureReport, errorMessage, createdAt, completedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
       appName=excluded.appName, packageName=excluded.packageName, versionName=excluded.versionName,
       versionCode=excluded.versionCode, status=excluded.status, stage=excluded.stage,
       branchName=excluded.branchName, dispatchTime=excluded.dispatchTime, githubRunId=excluded.githubRunId,
-      uploadZipPath=excluded.uploadZipPath,
+      uploadZipPath=excluded.uploadZipPath, appIconPath=excluded.appIconPath,
       apkSizeBytes=excluded.apkSizeBytes, apkLocalPath=excluded.apkLocalPath,
       durationMs=excluded.durationMs, scanIssues=excluded.scanIssues, failureReport=excluded.failureReport,
       errorMessage=excluded.errorMessage, completedAt=excluded.completedAt;`,
@@ -111,6 +113,7 @@ export async function upsertBuild(build: LocalBuild): Promise<void> {
       build.dispatchTime,
       build.githubRunId,
       build.uploadZipPath,
+      build.appIconPath,
       build.apkSizeBytes,
       build.apkLocalPath,
       build.durationMs,

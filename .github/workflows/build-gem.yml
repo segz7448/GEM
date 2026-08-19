@@ -1,0 +1,81 @@
+name: Build GEM APK
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Align Expo package versions with SDK
+        run: npx expo install --fix
+
+      - name: Prebuild native Android project
+        # Generates android/ from app.json + config plugins, and links
+        # the local modules/gem-foreground-service native module via
+        # autolinking. Runs entirely on the runner - no Expo account,
+        # token, or cloud service involved.
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Decode release keystore
+        if: env.HAS_RELEASE_KEYSTORE == 'true'
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x android/gradlew
+
+      - name: Build debug APK
+        working-directory: android
+        # Unsigned (auto-generated debug.keystore) - what you actually
+        # want for testing on your own device day to day.
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload GEM debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gem-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
+
+      - name: Build release APK
+        if: env.HAS_RELEASE_KEYSTORE == 'true'
+        working-directory: android
+        env:
+          RELEASE_STORE_FILE: release.keystore
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Upload GEM release APK
+        if: env.HAS_RELEASE_KEYSTORE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gem-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 14
+
+      - name: Note on skipped release build
+        if: env.HAS_RELEASE_KEYSTORE == 'false'
+        run: |
+          echo "::notice::Release build skipped - RELEASE_KEYSTORE_BASE64 secret is not set. \
+          See the 'Signing a release build' section in this repo's README to add one."

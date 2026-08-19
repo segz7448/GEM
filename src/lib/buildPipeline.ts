@@ -1,7 +1,8 @@
 import * as Crypto from 'expo-crypto';
 import * as FileSystem from 'expo-file-system';
-import { extractUploadZip, extractApkFromArtifactZip, extractTextFromLogZip, saveApkLocally } from './zipUtils';
+import { extractUploadZip, extractApkFromArtifactZip, extractTextFromLogZip, saveApkLocally, saveIconLocally } from './zipUtils';
 import { scanProject, extractAppMeta } from './projectScanner';
+import { extractAppIcon } from './iconExtractor';
 import { generateWorkflow, WORKFLOW_PATH, WORKFLOW_FILENAME } from './workflowGenerator';
 import { parseFailureLog } from './logParser';
 import { upsertBuild, patchBuild, getBuild, listBuilds, type LocalBuild } from './db';
@@ -118,11 +119,15 @@ async function runPipeline(buildId: string): Promise<void> {
     const meta = extractAppMeta(files);
     const blockingIssues = scan.issues.filter((i) => i.severity === 'error');
 
+    const icon = extractAppIcon(files, scan.type);
+    const appIconPath = icon ? await saveIconLocally(buildId, icon.base64, icon.mimeType).catch(() => null) : null;
+
     await patchBuild(buildId, {
       packageName: meta.packageName,
       versionName: meta.versionName,
       versionCode: meta.versionCode,
       scanIssues: scan.issues,
+      appIconPath,
     });
 
     if (scan.type === 'unknown' || blockingIssues.length > 0) {
