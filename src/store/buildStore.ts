@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { LocalBuildStatus } from './db';
+import type { LocalBuildStatus } from '../lib/db';
 
 interface LiveBuildState {
   status: LocalBuildStatus;

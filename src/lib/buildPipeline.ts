@@ -49,6 +49,7 @@ export async function runBuild(pickedLocalUri: string, originalFileName: string)
     dispatchTime: null,
     githubRunId: null,
     uploadZipPath,
+    appIconPath: null,
     apkSizeBytes: null,
     apkLocalPath: null,
     durationMs: null,
