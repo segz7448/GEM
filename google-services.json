@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "840663229270",
+    "project_id": "gem-app-2fb65",
+    "storage_bucket": "gem-app-2fb65.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:840663229270:android:f6b14318726e24f78a6cf7",
+        "android_client_info": {
+          "package_name": "com.gem.buildstudio"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDx6Nkwp9CdqTriuJ2bBmF3kZU1EIPj9xw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
