@@ -8,7 +8,7 @@ import { parseFailureLog } from './logParser';
 import { upsertBuild, patchBuild, getBuild, listBuilds, type LocalBuild } from './db';
 import { useBuildStore } from '../store/buildStore';
 import { upsertBuildNotification } from './notifications';
-import { startBuildKeepAlive, updateBuildKeepAliveMessage, stopBuildKeepAlive } from './buildKeepAlive';
+import { startBuildKeepAlive, updateBuildKeepAliveMessage, updateBuildKeepAliveProgress, stopBuildKeepAlive } from './buildKeepAlive';
 import * as gh from './githubClient';
 
 const POLL_INTERVAL_MS = 8_000;
@@ -16,6 +16,7 @@ const MAX_RUN_WAIT_MS = 30 * 60 * 1000;
 const DISPATCH_CORRELATION_WINDOW_MS = 90_000; // how long we search for a run before assuming dispatch never landed
 
 const UPLOAD_DIR = `${FileSystem.documentDirectory}pending-uploads/`;
+const ARTIFACT_TMP_DIR = `${FileSystem.documentDirectory}pending-artifacts/`;
 
 function setStage(buildId: string, appName: string | null, status: LocalBuild['status'], stage: string) {
   useBuildStore.getState().setLive(buildId, { status, stage });
@@ -188,7 +189,7 @@ async function runPipeline(buildId: string): Promise<void> {
     if (!dispatched) {
       dispatchTime = new Date().toISOString();
       await patchBuild(buildId, { dispatchTime });
-      await gh.dispatchWorkflow(WORKFLOW_FILENAME, branchName, { build_id: buildId });
+      await gh.dispatchWorkflow(WORKFLOW_FILENAME, branchName, { build_id: buildId, app_name: appName ?? 'your app' });
       dispatched = await pollUntil(
         () => gh.findDispatchedRun(WORKFLOW_FILENAME, branchName, dispatchTime!),
         (r) => r !== null,
@@ -240,22 +241,48 @@ export async function finishSuccessfulBuild(buildId: string, appName: string | n
   const artifact = artifacts.find((a) => a.name === `gem-build-${buildId}`);
   if (!artifact) throw new Error('Build succeeded but no artifact was produced.');
 
-  const artifactZipBase64 = await gh.downloadArtifactZipBase64(artifact.id);
-  const { name, base64 } = await extractApkFromArtifactZip(artifactZipBase64);
-  const saved = await saveApkLocally(buildId, name, base64);
+  // A second risky window (potentially large download + unzip) — same
+  // foreground-priority reasoning as the upload/dispatch window above,
+  // stopped again once this function returns either way.
+  startBuildKeepAlive(appName, 'Downloading build\u2026');
+  await FileSystem.makeDirectoryAsync(ARTIFACT_TMP_DIR, { intermediates: true }).catch(() => undefined);
+  const artifactZipPath = `${ARTIFACT_TMP_DIR}${buildId}.zip`;
+  try {
+    await gh.downloadArtifactZipToFile(artifact.id, artifactZipPath, (written, expected) => {
+      const pct = expected > 0 ? Math.round((written / expected) * 100) : null;
+      const message = pct !== null ? `Downloading build\u2026 ${pct}%` : `Downloading build\u2026 ${formatBytes(written)}`;
+      updateBuildKeepAliveProgress(message, written, expected > 0 ? expected : 0);
+    });
 
-  const build = await getBuild(buildId);
-  await patchBuild(buildId, {
-    status: 'completed',
-    stage: 'completed',
-    apkSizeBytes: saved.sizeBytes,
-    apkLocalPath: saved.uri,
-    durationMs: Date.now() - startedAt,
-    completedAt: new Date().toISOString(),
-    appName: appName || build?.packageName?.split('.').pop() || 'app',
-  });
-  await upsertBuildNotification(buildId, appName, 'completed');
-  await gh.deleteArtifact(artifact.id);
+    updateBuildKeepAliveProgress('Extracting APK\u2026', 0, 0);
+    const artifactZipBase64 = await FileSystem.readAsStringAsync(artifactZipPath, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    const { name, base64 } = await extractApkFromArtifactZip(artifactZipBase64);
+    const saved = await saveApkLocally(buildId, name, base64);
+
+    const build = await getBuild(buildId);
+    await patchBuild(buildId, {
+      status: 'completed',
+      stage: 'completed',
+      apkSizeBytes: saved.sizeBytes,
+      apkLocalPath: saved.uri,
+      durationMs: Date.now() - startedAt,
+      completedAt: new Date().toISOString(),
+      appName: appName || build?.packageName?.split('.').pop() || 'app',
+    });
+    await upsertBuildNotification(buildId, appName, 'completed');
+    await gh.deleteArtifact(artifact.id);
+  } finally {
+    await FileSystem.deleteAsync(artifactZipPath, { idempotent: true }).catch(() => undefined);
+    stopBuildKeepAlive();
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export async function finishFailedBuild(buildId: string, appName: string | null, runId: number, conclusion: string, startedAt: number): Promise<void> {

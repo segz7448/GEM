@@ -1,5 +1,5 @@
 import { Platform } from 'react-native';
-import { nativeStart, nativeUpdateMessage, nativeStop } from '../../modules/gem-foreground-service';
+import { nativeStart, nativeUpdateMessage, nativeUpdateProgress, nativeStop } from '../../modules/gem-foreground-service';
 
 /**
  * Wraps the risky window of a build (persisted upload -> confirmed
@@ -17,6 +17,12 @@ export function startBuildKeepAlive(appName: string | null, message: string): vo
 export function updateBuildKeepAliveMessage(message: string): void {
   if (Platform.OS !== 'android') return;
   nativeUpdateMessage(message);
+}
+
+/** max <= 0 shows an indeterminate spinner-style bar instead of a percentage. */
+export function updateBuildKeepAliveProgress(message: string, current: number, max: number): void {
+  if (Platform.OS !== 'android') return;
+  nativeUpdateProgress(message, current, max);
 }
 
 export function stopBuildKeepAlive(): void {

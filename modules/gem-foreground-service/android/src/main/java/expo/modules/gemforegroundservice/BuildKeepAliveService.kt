@@ -29,8 +29,12 @@ class BuildKeepAliveService : Service() {
   companion object {
     const val ACTION_START = "expo.modules.gemforegroundservice.START"
     const val ACTION_UPDATE = "expo.modules.gemforegroundservice.UPDATE"
+    const val ACTION_PROGRESS = "expo.modules.gemforegroundservice.PROGRESS"
     const val EXTRA_TITLE = "title"
     const val EXTRA_MESSAGE = "message"
+    const val EXTRA_PROGRESS_CURRENT = "progressCurrent"
+    const val EXTRA_PROGRESS_MAX = "progressMax"
+    const val EXTRA_PROGRESS_INDETERMINATE = "progressIndeterminate"
     private const val CHANNEL_ID = "gem_build_keepalive"
     private const val NOTIFICATION_ID = 4471
     private const val PREFS_NAME = "gem_foreground_service"
@@ -45,6 +49,15 @@ class BuildKeepAliveService : Service() {
         val message = intent.getStringExtra(EXTRA_MESSAGE) ?: return START_STICKY
         ensureChannel()
         val notification = buildNotification(storedTitle(), message)
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIFICATION_ID, notification)
+      }
+      ACTION_PROGRESS -> {
+        val message = intent.getStringExtra(EXTRA_MESSAGE) ?: return START_STICKY
+        val current = intent.getIntExtra(EXTRA_PROGRESS_CURRENT, 0)
+        val max = intent.getIntExtra(EXTRA_PROGRESS_MAX, 0)
+        val indeterminate = intent.getBooleanExtra(EXTRA_PROGRESS_INDETERMINATE, false)
+        ensureChannel()
+        val notification = buildNotification(storedTitle(), message, current, max, indeterminate)
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIFICATION_ID, notification)
       }
       else -> {
@@ -80,14 +93,26 @@ class BuildKeepAliveService : Service() {
     }
   }
 
-  private fun buildNotification(title: String, message: String): Notification {
-    return NotificationCompat.Builder(this, CHANNEL_ID)
+  private fun buildNotification(
+    title: String,
+    message: String,
+    progressCurrent: Int = 0,
+    progressMax: Int = 0,
+    progressIndeterminate: Boolean = false,
+  ): Notification {
+    val builder = NotificationCompat.Builder(this, CHANNEL_ID)
       .setContentTitle(title)
       .setContentText(message)
       .setSmallIcon(android.R.drawable.stat_sys_upload)
       .setOngoing(true)
       .setOnlyAlertOnce(true)
       .setPriority(NotificationCompat.PRIORITY_LOW)
-      .build()
+    // progressMax == 0 (the ACTION_UPDATE/ACTION_START default) means "no
+    // progress bar at all" - NotificationCompat only renders one when
+    // setProgress is actually called, so this is safe to always evaluate.
+    if (progressMax > 0 || progressIndeterminate) {
+      builder.setProgress(progressMax, progressCurrent, progressIndeterminate)
+    }
+    return builder.build()
   }
 }

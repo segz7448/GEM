@@ -1,8 +1,10 @@
 import { View, Text, TextInput, Pressable, ScrollView, Alert, ActivityIndicator } from 'react-native';
 import { useEffect, useState } from 'react';
 import * as FileSystem from 'expo-file-system';
+import * as Clipboard from 'expo-clipboard';
 import { AiProvider, getProviderConfig, saveProviderConfig, deleteProviderConfig, testConnection } from '@/lib/aiSettings';
 import { clearHistory, listBuilds } from '@/lib/db';
+import { registerForPushNotificationsAsync, getStoredPushToken } from '@/lib/push';
 
 const PROVIDERS: { id: AiProvider; label: string; defaultModel: string }[] = [
   { id: 'claude', label: 'Claude', defaultModel: 'claude-sonnet-4-6' },
@@ -80,6 +82,9 @@ function ProviderRow({ id, label, defaultModel }: { id: AiProvider; label: strin
 
 export default function SettingsScreen() {
   const [storageInfo, setStorageInfo] = useState<{ count: number; totalMb: number } | null>(null);
+  const [pushToken, setPushToken] = useState<string | null>(null);
+  const [pushStatus, setPushStatus] = useState<string | null>(null);
+  const [pushLoading, setPushLoading] = useState(false);
 
   const loadStorage = async () => {
     const builds = await listBuilds();
@@ -89,7 +94,30 @@ export default function SettingsScreen() {
 
   useEffect(() => {
     loadStorage();
+    getStoredPushToken().then(setPushToken);
   }, []);
+
+  const refreshPushToken = async () => {
+    setPushLoading(true);
+    setPushStatus(null);
+    const token = await registerForPushNotificationsAsync();
+    setPushLoading(false);
+    if (token) {
+      setPushToken(token);
+      setPushStatus('Token ready — copy it below into your repo\u2019s FCM_DEVICE_TOKEN secret.');
+    } else {
+      setPushToken(null);
+      setPushStatus(
+        'Couldn\u2019t get a token. Make sure google-services.json is bundled into this build and notification permission is granted.',
+      );
+    }
+  };
+
+  const copyPushToken = async () => {
+    if (!pushToken) return;
+    await Clipboard.setStringAsync(pushToken);
+    setPushStatus('Copied to clipboard.');
+  };
 
   const clearAllApks = () => {
     Alert.alert('Delete all APKs', 'This removes every downloaded APK from this device. Build history stays.', [
@@ -125,6 +153,39 @@ export default function SettingsScreen() {
       {PROVIDERS.map((p) => (
         <ProviderRow key={p.id} {...p} />
       ))}
+
+      <Text className="text-white text-lg font-semibold mb-3 mt-2">Push Notifications</Text>
+      <View className="bg-surface rounded-2xl p-4 mb-4">
+        <Text className="text-gray-400 text-sm mb-3">
+          GitHub Actions notifies this device directly via FCM when a build starts, succeeds, or fails - no backend
+          involved. This device's token needs to be pasted once into the repo's{' '}
+          <Text className="text-gray-300">FCM_DEVICE_TOKEN</Text> secret.
+        </Text>
+        <Pressable
+          onPress={refreshPushToken}
+          disabled={pushLoading}
+          className="bg-accent rounded-xl px-4 py-3 mb-2 items-center"
+        >
+          {pushLoading ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text className="text-white font-medium">{pushToken ? 'Refresh token' : 'Get device token'}</Text>
+          )}
+        </Pressable>
+        {pushToken && (
+          <>
+            <View className="bg-base rounded-xl px-3 py-2 mb-2">
+              <Text className="text-gray-300 text-xs" numberOfLines={3} selectable>
+                {pushToken}
+              </Text>
+            </View>
+            <Pressable onPress={copyPushToken} className="bg-base border border-gray-600 rounded-xl px-4 py-2 items-center">
+              <Text className="text-white">Copy token</Text>
+            </Pressable>
+          </>
+        )}
+        {pushStatus && <Text className="text-gray-400 text-sm mt-2">{pushStatus}</Text>}
+      </View>
 
       <Text className="text-white text-lg font-semibold mb-3 mt-2">Storage</Text>
       <View className="bg-surface rounded-2xl p-4 mb-4">

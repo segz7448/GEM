@@ -1,4 +1,5 @@
 import Constants from 'expo-constants';
+import * as FileSystem from 'expo-file-system';
 
 const extra = Constants.expoConfig?.extra ?? {};
 const TOKEN: string = extra.GITHUB_TOKEN ?? '';
@@ -240,6 +241,37 @@ export async function listArtifacts(runId: number): Promise<{ id: number; name: 
 
 export async function downloadArtifactZipBase64(artifactId: number): Promise<string> {
   return ghBinaryBase64(`/repos/${OWNER}/${REPO}/actions/artifacts/${artifactId}/zip`);
+}
+
+/**
+ * Streams the artifact zip straight to disk with real byte-level progress,
+ * instead of buffering the whole thing in memory via ghBinaryBase64. Used
+ * for the on-device download-progress notification — the network transfer
+ * is genuinely where the "downloading" stage's time goes, unlike the
+ * comparatively fast local unzip/base64 step after it.
+ */
+export async function downloadArtifactZipToFile(
+  artifactId: number,
+  destPath: string,
+  onProgress?: (bytesWritten: number, bytesExpected: number) => void,
+): Promise<void> {
+  const url = `${API_ROOT}/repos/${OWNER}/${REPO}/actions/artifacts/${artifactId}/zip`;
+  const downloadResumable = FileSystem.createDownloadResumable(
+    url,
+    destPath,
+    {
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    },
+    (progress) => onProgress?.(progress.totalBytesWritten, progress.totalBytesExpectedToWrite),
+  );
+  const result = await downloadResumable.downloadAsync();
+  if (!result || result.status < 200 || result.status >= 300) {
+    throw new Error(`GitHub artifact download failed with status ${result?.status ?? 'unknown'}`);
+  }
 }
 
 export async function downloadRunLogsZipBase64(runId: number): Promise<string> {

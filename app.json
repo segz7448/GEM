@@ -36,7 +36,8 @@
       ],
       "./plugins/withReleaseSigning",
       "./plugins/withGradleMemoryFix",
-      "./plugins/withStandaloneDebugBundle"
+      "./plugins/withStandaloneDebugBundle",
+      "./plugins/withGoogleServicesIfPresent"
     ],
     "extra": {
       "GITHUB_TOKEN": "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",
