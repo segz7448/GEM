@@ -110,7 +110,19 @@ export async function zipPickedDirectory(rootDirUri: string, folderName: string)
     for (const childUri of children) {
       const childDocId = decodeURIComponent(childUri.split('/document/')[1] ?? '');
       const relPath = childDocId.startsWith(`${rootDocId}/`) ? childDocId.slice(rootDocId.length + 1) : childDocId;
-      if (!relPath || relPath.includes('__MACOSX') || relPath.includes('/.git/') || relPath.startsWith('.git/')) continue;
+      if (!relPath || relPath.includes('__MACOSX')) continue;
+
+      // Bug fix: the previous check only skipped .git's *contents* (paths containing
+      // "/.git/"), not the ".git" directory entry itself — so the walk still recursed
+      // into it, and .git/objects/** can contain thousands of loose objects. Each one
+      // costs a separate SAF IPC round-trip (readDirectoryAsync + readAsStringAsync),
+      // which is what made folder picks hang for 15+ minutes on a small project.
+      // Skip by first path segment so this is caught before recursing in, not after.
+      const firstSegment = relPath.split('/')[0];
+      const EXCLUDED_DIRS = new Set(['.git', 'node_modules', '.expo', '.gradle', '.idea', '.vscode']);
+      if (EXCLUDED_DIRS.has(firstSegment)) continue;
+      if (relPath.startsWith('android/build/') || relPath.startsWith('android/app/build/') || relPath.startsWith('android/.gradle/')) continue;
+      if (relPath.startsWith('ios/Pods/') || relPath.startsWith('ios/build/')) continue;
 
       // SAF has no cheap "is this a directory" flag — the reliable way is to try
       // listing it as a directory; a file rejects, a directory succeeds.
