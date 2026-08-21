@@ -1,10 +1,12 @@
 import { View, Text, TextInput, Pressable, ScrollView, Alert, ActivityIndicator } from 'react-native';
 import { useEffect, useState } from 'react';
+import { useRouter } from 'expo-router';
 import * as FileSystem from 'expo-file-system';
 import * as Clipboard from 'expo-clipboard';
 import { AiProvider, getProviderConfig, saveProviderConfig, deleteProviderConfig, testConnection } from '@/lib/aiSettings';
 import { clearHistory, listBuilds } from '@/lib/db';
 import { registerForPushNotificationsAsync, getStoredPushToken } from '@/lib/push';
+import { setRepoSecret } from '@/lib/githubSecrets';
 
 const PROVIDERS: { id: AiProvider; label: string; defaultModel: string }[] = [
   { id: 'claude', label: 'Claude', defaultModel: 'claude-sonnet-4-6' },
@@ -81,10 +83,12 @@ function ProviderRow({ id, label, defaultModel }: { id: AiProvider; label: strin
 }
 
 export default function SettingsScreen() {
+  const router = useRouter();
   const [storageInfo, setStorageInfo] = useState<{ count: number; totalMb: number } | null>(null);
   const [pushToken, setPushToken] = useState<string | null>(null);
   const [pushStatus, setPushStatus] = useState<string | null>(null);
   const [pushLoading, setPushLoading] = useState(false);
+  const [sendingToken, setSendingToken] = useState(false);
 
   const loadStorage = async () => {
     const builds = await listBuilds();
@@ -117,6 +121,19 @@ export default function SettingsScreen() {
     if (!pushToken) return;
     await Clipboard.setStringAsync(pushToken);
     setPushStatus('Copied to clipboard.');
+  };
+
+  const sendPushTokenToRepo = async () => {
+    if (!pushToken) return;
+    setSendingToken(true);
+    try {
+      await setRepoSecret('FCM_DEVICE_TOKEN', pushToken);
+      setPushStatus('Sent \u2014 FCM_DEVICE_TOKEN is set on the repo. No copy-paste needed.');
+    } catch (err: any) {
+      setPushStatus(`Couldn\u2019t set the secret automatically: ${err.message ?? 'unknown error'}. You can still copy it above.`);
+    } finally {
+      setSendingToken(false);
+    }
   };
 
   const clearAllApks = () => {
@@ -179,12 +196,32 @@ export default function SettingsScreen() {
                 {pushToken}
               </Text>
             </View>
-            <Pressable onPress={copyPushToken} className="bg-base border border-gray-600 rounded-xl px-4 py-2 items-center">
-              <Text className="text-white">Copy token</Text>
-            </Pressable>
+            <View className="flex-row">
+              <Pressable onPress={copyPushToken} className="flex-1 bg-base border border-gray-600 rounded-xl px-4 py-2 items-center mr-2">
+                <Text className="text-white">Copy token</Text>
+              </Pressable>
+              <Pressable
+                onPress={sendPushTokenToRepo}
+                disabled={sendingToken}
+                className="flex-1 bg-accent rounded-xl px-4 py-2 items-center"
+              >
+                {sendingToken ? <ActivityIndicator size="small" color="#fff" /> : <Text className="text-white font-medium">Send to repo</Text>}
+              </Pressable>
+            </View>
           </>
         )}
         {pushStatus && <Text className="text-gray-400 text-sm mt-2">{pushStatus}</Text>}
+      </View>
+
+      <Text className="text-white text-lg font-semibold mb-3 mt-2">Repository Secrets</Text>
+      <View className="bg-surface rounded-2xl p-4 mb-4">
+        <Text className="text-gray-400 text-sm mb-3">
+          Manage FCM and release-signing secrets directly on GitHub — encrypted on this device before it ever leaves,
+          no need to open GitHub's website.
+        </Text>
+        <Pressable onPress={() => router.push('/secrets')} className="bg-accent rounded-xl px-4 py-3 items-center">
+          <Text className="text-white font-medium">Manage Secrets</Text>
+        </Pressable>
       </View>
 
       <Text className="text-white text-lg font-semibold mb-3 mt-2">Storage</Text>

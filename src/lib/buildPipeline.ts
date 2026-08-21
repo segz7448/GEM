@@ -1,11 +1,22 @@
 import * as Crypto from 'expo-crypto';
 import * as FileSystem from 'expo-file-system';
-import { extractUploadZip, extractApkFromArtifactZip, extractTextFromLogZip, saveApkLocally, saveIconLocally } from './zipUtils';
+import {
+  extractUploadZip,
+  extractApkFromArtifactZip,
+  extractAabFromArtifactZip,
+  extractTextFromLogZip,
+  saveApkLocally,
+  saveAabLocally,
+  saveIconLocally,
+  findGitignoreContent,
+  filterIgnoredEntries,
+} from './zipUtils';
 import { scanProject, extractAppMeta } from './projectScanner';
 import { extractAppIcon } from './iconExtractor';
 import { generateWorkflow, WORKFLOW_PATH, WORKFLOW_FILENAME } from './workflowGenerator';
 import { parseFailureLog } from './logParser';
-import { upsertBuild, patchBuild, getBuild, listBuilds, type LocalBuild } from './db';
+import { buildManifest } from './buildManifest';
+import { upsertBuild, patchBuild, getBuild, listBuilds, type LocalBuild, type BuildProfile } from './db';
 import { useBuildStore } from '../store/buildStore';
 import { upsertBuildNotification } from './notifications';
 import { startBuildKeepAlive, updateBuildKeepAliveMessage, updateBuildKeepAliveProgress, stopBuildKeepAlive } from './buildKeepAlive';
@@ -30,7 +41,7 @@ function setStage(buildId: string, appName: string | null, status: LocalBuild['s
 // ---------------------------------------------------------------------------
 
 /** Starts a brand-new build. Persists the zip to durable storage FIRST — that's the checkpoint everything else resumes from. */
-export async function runBuild(pickedLocalUri: string, originalFileName: string): Promise<string> {
+export async function runBuild(pickedLocalUri: string, originalFileName: string, profile: BuildProfile = 'debug'): Promise<string> {
   const buildId = Crypto.randomUUID();
   const appNameGuess = originalFileName.replace(/\.zip$/i, '');
 
@@ -53,6 +64,10 @@ export async function runBuild(pickedLocalUri: string, originalFileName: string)
     appIconPath: null,
     apkSizeBytes: null,
     apkLocalPath: null,
+    aabSizeBytes: null,
+    aabLocalPath: null,
+    buildProfile: profile,
+    fileManifest: null,
     durationMs: null,
     scanIssues: null,
     failureReport: null,
@@ -76,6 +91,44 @@ export async function resumePendingBuilds(): Promise<void> {
   for (const build of pending) {
     runPipeline(build.id).catch(() => undefined);
   }
+}
+
+/**
+ * Retries a failed build without re-uploading, when that's possible.
+ *
+ * A build that reached GitHub (has a githubRunId) can always be retried this
+ * way — `rerunWorkflow` re-runs the exact same commit on GitHub's side, and
+ * that doesn't depend on the per-build branch still existing (it's deleted
+ * right after the run finishes either way). A build that failed *before*
+ * dispatch — validation, push, etc. — has nothing on GitHub to re-run, and
+ * its local zip copy is deleted on failure by design (see `fail()`), so
+ * there's genuinely nothing to resume from; those need a fresh upload.
+ *
+ * Returns false (without throwing) for the "needs re-upload" case so the
+ * caller can show that distinctly from a real error.
+ */
+export async function retryBuild(buildId: string): Promise<boolean> {
+  const build = await getBuild(buildId);
+  if (!build || build.status !== 'failed') return false;
+  if (!build.githubRunId) return false;
+
+  await gh.rerunWorkflow(build.githubRunId);
+  await patchBuild(buildId, { errorMessage: null, failureReport: null, completedAt: null });
+  setStage(buildId, build.appName, 'starting_runner', 'retrying');
+
+  // Branch is already gone by the time a build reaches 'failed' (pollAndFinish's
+  // finally block deletes it on every path) — nothing to clean up again here.
+  //
+  // Small delay before polling: right after the rerun call, GitHub hasn't
+  // necessarily flipped the run's status off "completed" yet. Without this,
+  // pollAndFinish's first check could catch that stale status and immediately
+  // re-report the old (pre-retry) conclusion instead of waiting for the new run.
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  pollAndFinish(buildId, build.appName, build.githubRunId, null, Date.now()).catch(async (err: any) => {
+    await fail(buildId, build.appName, err.message, [{ errorType: 'pipeline', problem: 'Retry failed', rootCause: err.message }]);
+  });
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +167,15 @@ async function runPipeline(buildId: string): Promise<void> {
 
     setStage(buildId, appName, 'preparing', 'extracting_upload');
     startBuildKeepAlive(appName, 'Preparing build\u2026');
-    const files = await extractUploadZip(build.uploadZipPath);
+    const rawFiles = await extractUploadZip(build.uploadZipPath);
+
+    // node_modules/.git/build-output/etc. should never actually be committed to
+    // the scratch repo — CI regenerates them anyway, and committing them can
+    // blow well past GitHub's per-commit tree size limits. Same filter (and
+    // same default ignore list) the review screen shows the user before they
+    // ever tap Start Build, so what gets built always matches what was reviewed.
+    const gitignoreContent = findGitignoreContent(rawFiles);
+    const { kept: files } = filterIgnoredEntries(rawFiles, gitignoreContent);
 
     setStage(buildId, appName, 'scanning', 'analyzing_project');
     const scan = scanProject(files);
@@ -124,12 +185,17 @@ async function runPipeline(buildId: string): Promise<void> {
     const icon = extractAppIcon(files, scan.type);
     const appIconPath = icon ? await saveIconLocally(buildId, icon.base64, icon.mimeType).catch(() => null) : null;
 
+    // Manifest is persisted regardless of outcome — even a failed build's file
+    // list is a valid diff baseline for the *next* attempt at the same app.
+    const fileManifest = await buildManifest(files).catch(() => null);
+
     await patchBuild(buildId, {
       packageName: meta.packageName,
       versionName: meta.versionName,
       versionCode: meta.versionCode,
       scanIssues: scan.issues,
       appIconPath,
+      fileManifest,
     });
 
     if (scan.type === 'unknown' || blockingIssues.length > 0) {
@@ -145,7 +211,7 @@ async function runPipeline(buildId: string): Promise<void> {
     }
 
     setStage(buildId, appName, 'generating_workflow', 'preparing_ci_config');
-    const workflowYaml = generateWorkflow(scan.type);
+    const workflowYaml = generateWorkflow(scan.type, build.buildProfile);
     const pushFiles = files.map((f) => (f.isBinary ? { path: f.path, contentBase64: f.base64! } : { path: f.path, content: f.text! }));
     pushFiles.push({ path: WORKFLOW_PATH, content: workflowYaml });
 
@@ -237,9 +303,11 @@ async function pollAndFinish(buildId: string, appName: string | null, runId: num
 
 export async function finishSuccessfulBuild(buildId: string, appName: string | null, runId: number, startedAt: number): Promise<void> {
   setStage(buildId, appName, 'downloading', 'fetching_artifact');
+  const build = await getBuild(buildId);
   const artifacts = await gh.listArtifacts(runId);
   const artifact = artifacts.find((a) => a.name === `gem-build-${buildId}`);
   if (!artifact) throw new Error('Build succeeded but no artifact was produced.');
+  const aabArtifact = build?.buildProfile === 'release' ? artifacts.find((a) => a.name === `gem-build-${buildId}-aab`) : undefined;
 
   // A second risky window (potentially large download + unzip) — same
   // foreground-priority reasoning as the upload/dispatch window above,
@@ -247,6 +315,7 @@ export async function finishSuccessfulBuild(buildId: string, appName: string | n
   startBuildKeepAlive(appName, 'Downloading build\u2026');
   await FileSystem.makeDirectoryAsync(ARTIFACT_TMP_DIR, { intermediates: true }).catch(() => undefined);
   const artifactZipPath = `${ARTIFACT_TMP_DIR}${buildId}.zip`;
+  const aabZipPath = `${ARTIFACT_TMP_DIR}${buildId}-aab.zip`;
   try {
     await gh.downloadArtifactZipToFile(artifact.id, artifactZipPath, (written, expected) => {
       const pct = expected > 0 ? Math.round((written / expected) * 100) : null;
@@ -261,20 +330,40 @@ export async function finishSuccessfulBuild(buildId: string, appName: string | n
     const { name, base64 } = await extractApkFromArtifactZip(artifactZipBase64);
     const saved = await saveApkLocally(buildId, name, base64);
 
-    const build = await getBuild(buildId);
+    // AAB is best-effort: a release build that somehow produced an APK but no
+    // bundle still counts as a successful build — we just skip AAB fields.
+    let savedAab: { uri: string; sizeBytes: number } | null = null;
+    if (aabArtifact) {
+      try {
+        await gh.downloadArtifactZipToFile(aabArtifact.id, aabZipPath, (written, expected) => {
+          const pct = expected > 0 ? Math.round((written / expected) * 100) : null;
+          updateBuildKeepAliveProgress(pct !== null ? `Downloading AAB\u2026 ${pct}%` : 'Downloading AAB\u2026', written, expected > 0 ? expected : 0);
+        });
+        const aabZipBase64 = await FileSystem.readAsStringAsync(aabZipPath, { encoding: FileSystem.EncodingType.Base64 });
+        const aabFile = await extractAabFromArtifactZip(aabZipBase64);
+        savedAab = await saveAabLocally(buildId, aabFile.name, aabFile.base64);
+      } catch {
+        savedAab = null;
+      }
+    }
+
     await patchBuild(buildId, {
       status: 'completed',
       stage: 'completed',
       apkSizeBytes: saved.sizeBytes,
       apkLocalPath: saved.uri,
+      aabSizeBytes: savedAab?.sizeBytes ?? null,
+      aabLocalPath: savedAab?.uri ?? null,
       durationMs: Date.now() - startedAt,
       completedAt: new Date().toISOString(),
       appName: appName || build?.packageName?.split('.').pop() || 'app',
     });
     await upsertBuildNotification(buildId, appName, 'completed');
     await gh.deleteArtifact(artifact.id);
+    if (aabArtifact) await gh.deleteArtifact(aabArtifact.id).catch(() => undefined);
   } finally {
     await FileSystem.deleteAsync(artifactZipPath, { idempotent: true }).catch(() => undefined);
+    await FileSystem.deleteAsync(aabZipPath, { idempotent: true }).catch(() => undefined);
     stopBuildKeepAlive();
   }
 }

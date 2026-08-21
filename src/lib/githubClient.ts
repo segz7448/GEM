@@ -294,6 +294,17 @@ export async function cancelRun(runId: number): Promise<void> {
   }
 }
 
+/**
+ * Re-runs a completed workflow run against the same commit it already ran
+ * against. Doesn't require the branch that triggered it to still exist —
+ * GitHub keeps the run tied to the commit SHA it built, independent of
+ * whether the ref that pointed at it is still live. This is what makes a
+ * "Retry" button on an already-finished build possible without re-uploading.
+ */
+export async function rerunWorkflow(runId: number): Promise<void> {
+  await gh(`/repos/${OWNER}/${REPO}/actions/runs/${runId}/rerun`, { method: 'POST' });
+}
+
 /** Existence check only — used on resume to tell whether a push actually landed before the app died. */
 export async function fileExistsOnBranch(branchName: string, path: string): Promise<boolean> {
   try {

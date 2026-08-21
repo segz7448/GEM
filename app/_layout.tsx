@@ -46,6 +46,7 @@ export default function RootLayout() {
         <Stack.Screen name="upload" options={{ title: 'New Build' }} />
         <Stack.Screen name="history" options={{ title: 'Build History' }} />
         <Stack.Screen name="settings" options={{ title: 'Settings' }} />
+        <Stack.Screen name="secrets" options={{ title: 'Repository Secrets' }} />
         <Stack.Screen name="build/[id]" options={{ title: 'Build' }} />
       </Stack>
     </GestureHandlerRootView>
