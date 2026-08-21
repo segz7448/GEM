@@ -68,13 +68,28 @@ export function scanProject(files: ProjectFile[]): ScanResult {
     });
   }
 
+  // Only package.json/app.json are actually parsed by extractAppMeta below —
+  // a malformed *other* .json file elsewhere in the tree has never actually
+  // blocked a real build. Blanket strict-JSON-validating every .json file
+  // in the project used to fail the whole upload over completely normal
+  // files like tsconfig.json, which allows `//` comments (valid TypeScript
+  // JSONC, invalid strict JSON) and is present in nearly every real TS
+  // project. Skip known comment-tolerant config files entirely, and treat
+  // a parse failure in anything non-critical as a warning, not a blocker.
+  const JSONC_TOLERANT = /(^|\/)(tsconfig.*|jsconfig|\.babelrc|\.eslintrc|\.prettierrc)\.json$|(^|\/)\.vscode\/.*\.json$/;
+  const CRITICAL_JSON = /^(package|app|app\.config|eas)\.json$/;
+
   for (const file of files) {
     if (file.isBinary || !file.text) continue;
-    if (file.path.endsWith('.json')) {
+    if (file.path.endsWith('.json') && !JSONC_TOLERANT.test(file.path)) {
       try {
         JSON.parse(file.text);
       } catch {
-        issues.push({ severity: 'error', message: 'Invalid JSON.', file: file.path });
+        issues.push({
+          severity: CRITICAL_JSON.test(file.path) ? 'error' : 'warning',
+          message: 'Invalid JSON.',
+          file: file.path,
+        });
       }
     }
     if (file.path.endsWith('.xml') && !isWellFormedXml(file.text)) {

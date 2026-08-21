@@ -153,9 +153,13 @@ export async function zipPickedFiles(files: { uri: string; name: string }[], zip
  * duplicate already-processed files under the wrong path, so the walker stops there
  * instead of looping on bad data — but it does mean some nested files may be missing.
  * The caller should tell the user to zip the folder instead for a fully reliable
- * upload when this comes back true.
+ * upload when this comes back true. `fileCount` lets the caller distinguish a
+ * "some deep files might be missing" situation (proceed with a warning) from
+ * a "the walker got shut out entirely and found nothing" situation (block —
+ * there is no reasonable "continue anyway" when the result would be an empty
+ * project), rather than treating every incomplete walk the same way.
  */
-export async function zipPickedDirectory(rootDirUri: string, folderName: string): Promise<{ zipUri: string; possiblyIncomplete: boolean }> {
+export async function zipPickedDirectory(rootDirUri: string, folderName: string): Promise<{ zipUri: string; possiblyIncomplete: boolean; fileCount: number }> {
   const SAF = FileSystem.StorageAccessFramework;
   const zip = new JSZip();
   const defaultIgnoreRules = getDefaultRules();
@@ -166,7 +170,7 @@ export async function zipPickedDirectory(rootDirUri: string, folderName: string)
   const MAX_RECURSION_DEPTH = 25;
 
   const rootDocId = decodeURIComponent(rootDirUri.split('/document/')[1] ?? '');
-  const state = { possiblyIncomplete: false };
+  const state = { possiblyIncomplete: false, fileCount: 0 };
 
   async function walk(dirUri: string, depth: number, parentListing: string[] | null) {
     if (depth > MAX_RECURSION_DEPTH) return;
@@ -220,13 +224,14 @@ export async function zipPickedDirectory(rootDirUri: string, folderName: string)
           zip.file(relPath, bytesToUtf8(bytes));
         }
         void childListing; // unreachable for files (readDirectoryAsync threw) — present only to satisfy the try/catch's type
+        state.fileCount++;
       }
     }
   }
 
   await walk(rootDirUri, 0, null);
   const zipUri = await writeZipToTemp(zip, `${folderName}.zip`);
-  return { zipUri, possiblyIncomplete: state.possiblyIncomplete };
+  return { zipUri, possiblyIncomplete: state.possiblyIncomplete, fileCount: state.fileCount };
 }
 
 function arraysEqual(a: string[], b: string[]): boolean {

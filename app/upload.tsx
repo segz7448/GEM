@@ -46,6 +46,21 @@ export default function UploadScreen() {
       const allFiles = await extractUploadZip(source.uri);
       const gitignoreContent = findGitignoreContent(allFiles);
       const { kept, ignored } = filterIgnoredEntries(allFiles, gitignoreContent);
+
+      if (kept.length === 0) {
+        // Never let an empty result reach the review screen with an enabled
+        // Start Build button — that only leads to a confusing downstream
+        // failure. Bail out here with a clear reason instead.
+        Alert.alert(
+          'No buildable files found',
+          ignored.length > 0
+            ? `Everything in this selection (${ignored.length} file${ignored.length === 1 ? '' : 's'}) was excluded as node_modules, .git, build output, or similar. Make sure you selected the project source itself, not just its dependency/build folders.`
+            : 'This selection appears to be empty.',
+        );
+        setPicked(null);
+        return;
+      }
+
       setReviewFiles(kept);
       setIgnoredFiles(ignored);
 
@@ -131,7 +146,7 @@ export default function UploadScreen() {
     try {
       const decodedDocId = decodeURIComponent(perm.directoryUri.split('/document/')[1] ?? '');
       const folderName = decodedDocId.split('/').filter(Boolean).pop() || 'project';
-      const { zipUri, possiblyIncomplete } = await zipPickedDirectory(perm.directoryUri, folderName);
+      const { zipUri, possiblyIncomplete, fileCount } = await zipPickedDirectory(perm.directoryUri, folderName);
       setPreparing(null);
 
       // A confirmed Android/Expo quirk (expo/expo#20102) can make a subfolder's
@@ -139,6 +154,20 @@ export default function UploadScreen() {
       // walker stops there rather than duplicating bad data, but it does mean
       // some nested files may be missing. Surface that plainly rather than
       // silently handing over an incomplete project.
+      if (fileCount === 0) {
+        // No reasonable "continue anyway" here — an empty zip would only reach
+        // Start Build and fail downstream with a confusing "unrecognized
+        // project type" error. Block immediately with a clear explanation
+        // instead of leaving the person to work that out from a build failure.
+        Alert.alert(
+          'No files found',
+          possiblyIncomplete
+            ? 'Android\u2019s folder picker couldn\u2019t reliably read this folder\u2019s contents — this is a known issue on some devices (especially MIUI/Xiaomi). Please zip the folder first and use "Choose ZIP File" instead, which doesn\u2019t have this limitation.'
+            : 'This folder appears to be empty, or everything in it was excluded by default (node_modules, .git, build output, etc.).',
+        );
+        return;
+      }
+
       if (possiblyIncomplete) {
         const proceed = await new Promise<boolean>((resolve) => {
           Alert.alert(
