@@ -6,7 +6,9 @@
   "scripts": {
     "start": "expo start",
     "android": "expo run:android",
-    "ios": "expo run:ios"
+    "ios": "expo run:ios",
+    "test:scanner": "node scripts/test-project-scanner.cjs",
+    "test:icons": "node scripts/test-icon-set.cjs"
   },
   "dependencies": {
     "@expo/config-plugins": "~8.0.0",
@@ -41,7 +43,8 @@
     "react-native-screens": "3.31.1",
     "tweetnacl": "^1.0.3",
     "tweetnacl-sealedbox-js": "^1.2.0",
-    "zustand": "^4.5.4"
+    "zustand": "^4.5.4",
+    "@expo/vector-icons": "^14.0.4"
   },
   "devDependencies": {
     "@babel/core": "^7.24.0",

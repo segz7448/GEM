@@ -7,51 +7,49 @@ compiled app is concerned, GEM builds it themselves; the GitHub layer
 only becomes visible to someone who decompiles the APK and reads the
 bundled JS.
 
-**This intentionally holds a full read/write GitHub token client-side.**
-That was an explicit decision (see conversation) for a dedicated
-throwaway GitHub account with nothing else on it — not a default
-recommendation. If this account ever holds anything else, or the app
-gets wide distribution, revisit that.
+GEM uses the configured GitHub token for direct GitHub API access; build uploads and Actions runs use the selected build-target repository.
 
-## Before building
+## Configure the build target
 
-Edit `app.json` → `expo.extra`:
+Choose a GitHub repository with a base branch and GitHub Actions enabled. You can use this same GEM repository as the target. Each build pushes the selected project files and generated workflow to a temporary branch, builds an APK, downloads it, then deletes the temporary branch. If the target repo is public, those uploaded source files and the branch are visible to anyone until cleanup; GEM asks you to confirm each public build.
+
+In GEM, open Settings → GitHub Build Target and enter the owner, repository name, and base branch. GEM stores these target fields in Android SecureStore and checks that the repository exists, the branch exists, and Actions are enabled before it starts.
+
+The app still needs a GitHub token configured as `GITHUB_TOKEN` under `expo.extra`:
 
 ```json
 "extra": {
   "GITHUB_TOKEN": "<your GT_TOKEN>",
-  "GITHUB_OWNER": "<your username or org>",
-  "GITHUB_REPO": "<the private repo GEM builds through>",
+  "GITHUB_OWNER": "<default owner for the Settings form>",
+  "GITHUB_REPO": "<default target; may be GEM>",
   "GITHUB_BASE_BRANCH": "main"
 }
 ```
 
-The target repo needs at least one commit on that base branch and
-Actions enabled. `GT_TOKEN_KEY` (admin) is intentionally **not**
-referenced anywhere in this app — nothing in the pipeline needs
-elevated scope, so it stays out entirely.
+The token must be able to read/write contents and run Actions in the selected target repository. Managing repository secrets needs the additional GitHub Actions secrets permission.
 
 **First build only:** GEM checks whether `.github/workflows/gem-android.yml`
-already exists on your base branch, and if not, commits it there
-directly (`githubClient.ts` → `ensureWorkflowRegistered`) before doing
-anything else. This is required, not optional — GitHub only treats a
-`workflow_dispatch` workflow as dispatchable via the API once it
-exists on the *default* branch specifically; a per-build temp branch
-having the file isn't enough on its own. So expect one extra commit
-to land on your base branch the first time you run a build. After
+already exists on your base branch, and if not, registers it on the repository's *default branch*
+(`githubClient.ts` → `ensureWorkflowRegistered`) before dispatch. GitHub
+requires the workflow file on the default branch even when a build uses
+a different configured base branch, so the first build may add one
+workflow-registration commit to the default branch. After
 that it's a no-op check on every subsequent build.
 
-## How a build actually runs (all on-device, `src/lib/buildPipeline.ts`)
+The UI uses one Material Community vector-icon set for navigation, project states, actions, and empty/error states. The custom 1024px launcher mark is a faceted violet-and-mint gem on a dark field.
+
+## How a build actually runs (`src/lib/buildPipeline.ts`)
 
 1. `expo-document-picker` → zip picked, immediately copied to durable
    storage (`documentDirectory/pending-uploads/`) — this is the
    checkpoint everything else resumes from
 2. `zipUtils.ts` (JSZip) extracts it in memory, Zip-Slip guarded
-3. `projectScanner.ts` detects project type (native Android, bare
-   React Native, **managed Expo** — no committed `android/` folder —
-   Flutter, Capacitor, Cordova) + validates structure, and
-   `iconExtractor.ts` pulls the app icon out of the source if one is
-   findable
+3. `projectScanner.ts` reads manifests, package dependencies, Android
+   project structure and source markers to detect project type (native
+   Android, React Native, managed Expo, Flutter, Capacitor, Cordova) and
+   validates the configuration. It shows the evidence and issues before
+   build; it does not infer app features or review code behavior.
+   `iconExtractor.ts` extracts the app icon when recognizable
 4. `workflowGenerator.ts` produces `.github/workflows/gem-android.yml`
 5. The native foreground service starts here (see below) — the branch
    create/push/dispatch sequence is the one part of the pipeline that
@@ -93,7 +91,7 @@ reads from — history, the build detail screen, and the background task.
 | `expo-crypto` | generating each build's UUID |
 | `expo-notifications` | live-updating build-progress notification (same identifier reused per build) |
 | `expo-task-manager` + `expo-background-fetch` | resumes polling a dispatched run's status while the app is closed |
-| `expo-secure-store` | encrypted storage for user-supplied AI provider keys |
+| `expo-secure-store` | encrypted storage for user-supplied AI provider keys and the build-target repository selection |
 | `expo-sharing` / `expo-intent-launcher` | opening/sharing the finished APK |
 | `expo-router` | screens/navigation |
 
@@ -128,17 +126,11 @@ GitHub Actions — same idea as what this app does for other projects,
 just run once, manually, for GEM's own source. See "Signing a release
 build" below for the release-build half of it.
 
-**Push this project to its own separate GitHub repo — not
-`segz7448/GEM`.** That repo is the scratch build-runner GEM's pipeline
-pushes `build/{id}` branches into and commits `gem-android.yml`
-directly to `main` of; GEM's own source living there too would
-collide with both.
+The repository's own `build-gem.yml` workflow builds GEM itself. GEM's in-app builder can also use this repository as its target: it writes uploaded projects to temporary `build/{id}` branches, without overwriting the `main` source files. If the repo is public, those temporary source branches are public too, so GEM asks before uploading to a public target.
 
 ## Signing a release build
 
-`build-gem.yml` always builds a debug APK. It also builds a **signed
-release APK**, but only if these four repo secrets are set (on
-whichever repo you push this project to):
+`build-gem.yml` always builds a debug APK. For an in-app Gradle release build, GEM uses the same four secrets to sign the APK and AAB when all are configured:
 
 | Secret | What it is |
 |---|---|
@@ -146,6 +138,8 @@ whichever repo you push this project to):
 | `RELEASE_STORE_PASSWORD` | keystore password |
 | `RELEASE_KEY_ALIAS` | key alias inside the keystore |
 | `RELEASE_KEY_PASSWORD` | password for that specific key |
+
+Flutter release signing is not yet wired to these secrets; its workflow can produce a release APK/AAB but may be unsigned.
 
 If you don't already have a keystore:
 

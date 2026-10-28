@@ -1,11 +1,16 @@
 import Constants from 'expo-constants';
 import * as sealedbox from 'tweetnacl-sealedbox-js';
+import { getBuildTarget } from './buildTarget';
 
 const extra = Constants.expoConfig?.extra ?? {};
 const TOKEN: string = extra.GITHUB_TOKEN ?? '';
-const OWNER: string = extra.GITHUB_OWNER ?? '';
-const REPO: string = extra.GITHUB_REPO ?? '';
+
 const API_ROOT = 'https://api.github.com';
+
+async function repositoryPath(): Promise<string> {
+  const target = await getBuildTarget();
+  return `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}`;
+}
 
 /**
  * Writes real repo secrets (FCM_DEVICE_TOKEN, signing keystore material, etc.) directly
@@ -107,26 +112,26 @@ function utf8ToBytes(str: string): Uint8Array {
 
 /** Lists secret names + last-updated timestamps for the configured repo. Values are never returned by GitHub. */
 export async function listRepoSecrets(): Promise<RepoSecretSummary[]> {
-  const data = await gh<{ secrets: { name: string; updated_at: string }[] }>(`/repos/${OWNER}/${REPO}/actions/secrets`);
+  const data = await gh<{ secrets: { name: string; updated_at: string }[] }>(`${await repositoryPath()}/actions/secrets`);
   return data.secrets.map((s) => ({ name: s.name, updatedAt: s.updated_at }));
 }
 
 /** Encrypts `value` against the repo's current public key and upserts it as `name`. */
 export async function setRepoSecret(name: string, value: string): Promise<void> {
-  const pk = await gh<PublicKeyResponse>(`/repos/${OWNER}/${REPO}/actions/secrets/public-key`);
+  const pk = await gh<PublicKeyResponse>(`${await repositoryPath()}/actions/secrets/public-key`);
   const publicKeyBytes = base64ToBytes(pk.key);
   const messageBytes = utf8ToBytes(value);
   const encryptedBytes = sealedbox.seal(messageBytes, publicKeyBytes);
   const encryptedValueBase64 = bytesToBase64(encryptedBytes);
 
-  await gh(`/repos/${OWNER}/${REPO}/actions/secrets/${encodeURIComponent(name)}`, {
+  await gh(`${await repositoryPath()}/actions/secrets/${encodeURIComponent(name)}`, {
     method: 'PUT',
     body: JSON.stringify({ encrypted_value: encryptedValueBase64, key_id: pk.key_id }),
   });
 }
 
 export async function deleteRepoSecret(name: string): Promise<void> {
-  await gh(`/repos/${OWNER}/${REPO}/actions/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  await gh(`${await repositoryPath()}/actions/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' });
 }
 
 /** Base64-encodes an arbitrary local file for use as a secret value (e.g. an Android keystore). */
@@ -139,8 +144,8 @@ export async function encodeFileAsBase64Secret(localUri: string): Promise<string
 export const KNOWN_SECRETS = [
   { name: 'FCM_DEVICE_TOKEN', description: 'This device\u2019s FCM token, for build-status push notifications.' },
   { name: 'FIREBASE_SERVICE_ACCOUNT_JSON', description: 'Firebase service account key JSON, used to authenticate FCM sends.' },
-  { name: 'ANDROID_KEYSTORE_BASE64', description: 'Base64-encoded release signing keystore (.jks).' },
-  { name: 'ANDROID_KEYSTORE_PASSWORD', description: 'Password for the keystore file.' },
-  { name: 'ANDROID_KEY_ALIAS', description: 'Alias of the signing key inside the keystore.' },
-  { name: 'ANDROID_KEY_PASSWORD', description: 'Password for that specific key alias.' },
+  { name: 'RELEASE_KEYSTORE_BASE64', description: 'Base64-encoded release signing keystore (.jks).' },
+  { name: 'RELEASE_STORE_PASSWORD', description: 'Password for the keystore file.' },
+  { name: 'RELEASE_KEY_ALIAS', description: 'Alias of the signing key inside the keystore.' },
+  { name: 'RELEASE_KEY_PASSWORD', description: 'Password for that specific key alias.' },
 ] as const;

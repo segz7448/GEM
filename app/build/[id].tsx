@@ -6,6 +6,7 @@ import * as IntentLauncher from 'expo-intent-launcher';
 import { getBuild, type LocalBuild } from '@/lib/db';
 import { retryBuild } from '@/lib/buildPipeline';
 import { useBuildStore } from '@/store/buildStore';
+import { Icon, buildStatusIcon } from '@/components/Icon';
 
 const STAGES = [
   'queued',
@@ -46,7 +47,7 @@ export default function BuildDetailScreen() {
   if (!build) {
     return (
       <View className="flex-1 bg-base items-center justify-center">
-        <Text className="text-gray-500">Loading…</Text>
+        <Icon name="progress-clock" size={32} color="#A78BFA" /><Text className="text-gray-500 mt-3">Loading build…</Text>
       </View>
     );
   }
@@ -97,18 +98,14 @@ export default function BuildDetailScreen() {
 
   return (
     <ScrollView className="flex-1 bg-base px-4 pt-4">
-      <Text className="text-white text-xl font-bold mb-1">{build.appName || 'Build'}</Text>
+      <View className="flex-row items-center mb-1"><View className="w-11 h-11 rounded-xl bg-surface items-center justify-center mr-3"><Icon name={buildStatusIcon(build.stage || build.status).name} size={24} color={buildStatusIcon(build.stage || build.status).color} /></View><View className="flex-1"><Text className="text-white text-xl font-bold">{build.appName || 'Build'}</Text><Text className="text-gray-500 text-xs">{build.status.replace(/_/g, ' ')}</Text></View></View>
       <Text className="text-gray-400 mb-6">{build.packageName || 'Detecting project type…'}</Text>
 
       {build.status !== 'failed' && build.status !== 'cancelled' && (
         <View className="mb-6">
           {STAGES.map((stage, i) => (
             <View key={stage} className="flex-row items-center mb-2">
-              <View
-                className={`w-3 h-3 rounded-full mr-3 ${
-                  i < currentIndex ? 'bg-success' : i === currentIndex ? 'bg-accent' : 'bg-gray-700'
-                }`}
-              />
+              <Icon name={buildStatusIcon(stage).name} size={19} color={i <= currentIndex ? buildStatusIcon(stage).color : '#4B4957'} style={{ marginRight: 10 }} />
               <Text className={i <= currentIndex ? 'text-white' : 'text-gray-600'}>{stage.replace(/_/g, ' ')}</Text>
             </View>
           ))}
@@ -117,7 +114,7 @@ export default function BuildDetailScreen() {
 
       {build.status === 'completed' && (
         <View className="bg-surface rounded-2xl p-4 mb-4">
-          <Text className="text-success font-semibold mb-2">Build complete</Text>
+          <View className="flex-row items-center mb-3"><Icon name="check-circle" size={21} color="#4ADE80" style={{ marginRight: 8 }} /><Text className="text-success font-semibold">APK ready</Text></View>
           <Text className="text-gray-300">Package: {build.packageName ?? 'unknown'}</Text>
           <Text className="text-gray-300">Version: {build.versionName ?? 'unknown'}</Text>
           <Text className="text-gray-300">Profile: {build.buildProfile === 'release' ? 'Release' : 'Debug'}</Text>
@@ -125,14 +122,14 @@ export default function BuildDetailScreen() {
           {build.aabSizeBytes && <Text className="text-gray-300">AAB size: {Math.round(build.aabSizeBytes / 1024 / 1024)} MB</Text>}
           <View className="flex-row mt-4 flex-wrap">
             <Pressable onPress={openApk} className="bg-accent rounded-xl px-4 py-3 mr-3 mb-2">
-              <Text className="text-white font-medium">Open APK</Text>
+              <View className="flex-row items-center"><Icon name="open-in-new" size={18} color="#fff" style={{ marginRight: 7 }} /><Text className="text-white font-medium">Open APK</Text></View>
             </Pressable>
             <Pressable onPress={shareApk} className="bg-surface border border-gray-600 rounded-xl px-4 py-3 mr-3 mb-2">
-              <Text className="text-white font-medium">Share APK</Text>
+              <View className="flex-row items-center"><Icon name="share-variant-outline" size={18} color="#fff" style={{ marginRight: 7 }} /><Text className="text-white font-medium">Share APK</Text></View>
             </Pressable>
             {build.aabLocalPath && (
               <Pressable onPress={shareAab} className="bg-surface border border-gray-600 rounded-xl px-4 py-3 mb-2">
-                <Text className="text-white font-medium">Share AAB</Text>
+                <View className="flex-row items-center"><Icon name="share-variant-outline" size={18} color="#fff" style={{ marginRight: 7 }} /><Text className="text-white font-medium">Share AAB</Text></View>
               </Pressable>
             )}
           </View>
@@ -141,7 +138,7 @@ export default function BuildDetailScreen() {
 
       {build.status === 'failed' && (
         <View>
-          <Text className="text-danger font-semibold text-lg mb-3">Build failed</Text>
+          <View className="flex-row items-center mb-3"><Icon name="alert-circle" size={22} color="#FB7185" style={{ marginRight: 8 }} /><Text className="text-danger font-semibold text-lg">Build failed</Text></View>
           {(build.failureReport ?? []).map((f, i) => (
             <View key={i} className="bg-surface rounded-2xl p-4 mb-3">
               <Text className="text-white font-medium mb-1">{f.problem}</Text>
@@ -156,7 +153,7 @@ export default function BuildDetailScreen() {
             </View>
           ))}
           <Pressable onPress={retry} disabled={retrying} className="bg-accent rounded-xl px-4 py-3 items-center self-start mb-2">
-            {retrying ? <ActivityIndicator color="#fff" /> : <Text className="text-white font-medium">Retry</Text>}
+            {retrying ? <ActivityIndicator color="#fff" /> : <View className="flex-row items-center"><Icon name="refresh" size={18} color="#fff" style={{ marginRight: 7 }} /><Text className="text-white font-medium">Retry build</Text></View>}
           </Pressable>
           <Text className="text-gray-500 text-xs">
             {build.githubRunId
@@ -168,11 +165,12 @@ export default function BuildDetailScreen() {
 
       {build.scanIssues && build.scanIssues.length > 0 && build.status !== 'failed' && (
         <View className="bg-surface rounded-2xl p-4 mb-4">
-          <Text className="text-warn font-medium mb-2">Notices</Text>
+          <View className="flex-row items-center mb-2"><Icon name="alert-outline" size={18} color="#FBBF24" style={{ marginRight: 7 }} /><Text className="text-warn font-medium">Notices</Text></View>
           {build.scanIssues.map((issue, i) => (
-            <Text key={i} className="text-gray-400 text-sm mb-1">
-              • {issue.message}
-            </Text>
+            <View key={`${issue.file ?? 'issue'}-${i}`} className="flex-row items-start mb-1">
+              <Icon name={issue.severity === 'error' ? 'alert-circle-outline' : 'alert-outline'} size={15} color={issue.severity === 'error' ? '#FB7185' : '#FBBF24'} style={{ marginRight: 7, marginTop: 2 }} />
+              <Text className="text-gray-400 text-sm flex-1">{issue.message}</Text>
+            </View>
           ))}
         </View>
       )}

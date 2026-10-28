@@ -5,6 +5,7 @@ module.exports = {
       colors: {
         base: '#0B0B12',
         surface: '#15151F',
+        line: '#2A2937',
         accent: '#6C5CE7',
         success: '#2ECC71',
         danger: '#E74C3C',

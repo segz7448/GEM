@@ -41,7 +41,14 @@ function setStage(buildId: string, appName: string | null, status: LocalBuild['s
 // ---------------------------------------------------------------------------
 
 /** Starts a brand-new build. Persists the zip to durable storage FIRST — that's the checkpoint everything else resumes from. */
-export async function runBuild(pickedLocalUri: string, originalFileName: string, profile: BuildProfile = 'debug'): Promise<string> {
+export async function runBuild(pickedLocalUri: string, originalFileName: string, profile: BuildProfile = 'debug', publicTargetConfirmed = false): Promise<string> {
+  // Validate before persisting a build or uploading source. Public targets require
+  // explicit per-build confirmation from the upload screen because branch contents
+  // and build logs may be visible to anyone.
+  const targetCheck = await gh.validateBuildTarget();
+  if (!targetCheck.isPrivate && !publicTargetConfirmed) {
+    throw new Error('This build target is public. Confirm in the upload screen before sending project files.');
+  }
   const buildId = Crypto.randomUUID();
   const appNameGuess = originalFileName.replace(/\.zip$/i, '');
 

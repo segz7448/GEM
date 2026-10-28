@@ -9,7 +9,9 @@
     "splash": {
       "backgroundColor": "#0B0B12"
     },
-    "assetBundlePatterns": ["**/*"],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "android": {
       "package": "com.gem.buildstudio",
       "permissions": [
@@ -17,7 +19,11 @@
         "RECEIVE_BOOT_COMPLETED",
         "FOREGROUND_SERVICE",
         "FOREGROUND_SERVICE_DATA_SYNC"
-      ]
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/gem-launcher-icon.png",
+        "backgroundColor": "#111321"
+      }
     },
     "plugins": [
       "expo-router",
@@ -44,6 +50,7 @@
       "GITHUB_OWNER": "segz7448",
       "GITHUB_REPO": "GEM",
       "GITHUB_BASE_BRANCH": "main"
-    }
+    },
+    "icon": "./assets/gem-launcher-icon.png"
   }
 }

@@ -1,13 +1,17 @@
 import Constants from 'expo-constants';
 import * as FileSystem from 'expo-file-system';
+import { getBuildTarget } from './buildTarget';
 
 const extra = Constants.expoConfig?.extra ?? {};
 const TOKEN: string = extra.GITHUB_TOKEN ?? '';
-const OWNER: string = extra.GITHUB_OWNER ?? '';
-const REPO: string = extra.GITHUB_REPO ?? '';
-const BASE_BRANCH: string = extra.GITHUB_BASE_BRANCH ?? 'main';
+
 
 const API_ROOT = 'https://api.github.com';
+
+async function repositoryPath(): Promise<string> {
+  const target = await getBuildTarget();
+  return `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}`;
+}
 
 async function gh<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_ROOT}${path}`, {
@@ -103,9 +107,21 @@ export interface PushFile {
   contentBase64?: string;
 }
 
+export async function validateBuildTarget(): Promise<{ isPrivate: boolean }> {
+  const target = await getBuildTarget();
+  const repo = await gh<{ private?: boolean; default_branch?: string }>(await repositoryPath());
+  if (repo.default_branch !== target.branch) {
+    const branch = await gh<{ object: { sha: string } }>(`${await repositoryPath()}/git/ref/heads/${target.branch}`);
+    if (!branch.object?.sha) throw new Error(`Base branch "${target.branch}" was not found in ${target.owner}/${target.repo}.`);
+  }
+  const permissions = await gh<{ enabled?: boolean }>(`${await repositoryPath()}/actions/permissions`);
+  if (permissions.enabled === false) throw new Error('GitHub Actions is disabled for the configured build-target repository. Enable it, then retry.');
+  return { isPrivate: repo.private === true };
+}
+
 export async function getFileSha(branchName: string, path: string): Promise<string | null> {
   try {
-    const data = await gh<{ sha: string }>(`/repos/${OWNER}/${REPO}/contents/${path}?ref=${branchName}`);
+    const data = await gh<{ sha: string }>(`${await repositoryPath()}/contents/${path}?ref=${branchName}`);
     return data.sha;
   } catch {
     return null;
@@ -113,7 +129,7 @@ export async function getFileSha(branchName: string, path: string): Promise<stri
 }
 
 export async function putFile(branchName: string, path: string, content: string, message: string, existingSha: string | null): Promise<void> {
-  await gh(`/repos/${OWNER}/${REPO}/contents/${path}`, {
+  await gh(`${await repositoryPath()}/contents/${path}`, {
     method: 'PUT',
     body: JSON.stringify({
       message,
@@ -136,19 +152,23 @@ export async function putFile(branchName: string, path: string, content: string,
  * build always come from what's pushed to that build's own branch.
  */
 export async function ensureWorkflowRegistered(path: string, content: string): Promise<void> {
-  const existingSha = await getFileSha(BASE_BRANCH, path);
+  const target = await getBuildTarget();
+  const repository = await gh<{ default_branch?: string }>(await repositoryPath());
+  const workflowBranch = repository.default_branch || target.branch;
+  const existingSha = await getFileSha(workflowBranch, path);
   if (existingSha) return; // already registered — nothing to do
-  await putFile(BASE_BRANCH, path, content, 'GEM: register build workflow on default branch', null);
+  await putFile(workflowBranch, path, content, 'GEM: register build workflow on default branch', null);
 }
 
 export async function getBaseBranchSha(): Promise<string> {
-  const data = await gh<{ object: { sha: string } }>(`/repos/${OWNER}/${REPO}/git/ref/heads/${BASE_BRANCH}`);
+  const target = await getBuildTarget();
+  const data = await gh<{ object: { sha: string } }>(`${await repositoryPath()}/git/ref/heads/${encodeURIComponent(target.branch)}`);
   return data.object.sha;
 }
 
 export async function getBranchRef(branchName: string): Promise<string | null> {
   try {
-    const data = await gh<{ object: { sha: string } }>(`/repos/${OWNER}/${REPO}/git/ref/heads/${branchName}`);
+    const data = await gh<{ object: { sha: string } }>(`${await repositoryPath()}/git/ref/heads/${branchName}`);
     return data.object.sha;
   } catch {
     return null;
@@ -156,7 +176,7 @@ export async function getBranchRef(branchName: string): Promise<string | null> {
 }
 
 export async function createBranch(branchName: string, fromSha: string): Promise<void> {
-  await gh(`/repos/${OWNER}/${REPO}/git/refs`, {
+  await gh(`${await repositoryPath()}/git/refs`, {
     method: 'POST',
     body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha: fromSha }),
   });
@@ -164,19 +184,19 @@ export async function createBranch(branchName: string, fromSha: string): Promise
 
 export async function deleteBranch(branchName: string): Promise<void> {
   try {
-    await gh(`/repos/${OWNER}/${REPO}/git/refs/heads/${branchName}`, { method: 'DELETE' });
+    await gh(`${await repositoryPath()}/git/refs/heads/${branchName}`, { method: 'DELETE' });
   } catch {
     // Idempotent cleanup — already gone is fine.
   }
 }
 
 export async function pushFiles(branchName: string, baseSha: string, files: PushFile[], message: string): Promise<string> {
-  const baseCommit = await gh<{ tree: { sha: string } }>(`/repos/${OWNER}/${REPO}/git/commits/${baseSha}`);
+  const baseCommit = await gh<{ tree: { sha: string } }>(`${await repositoryPath()}/git/commits/${baseSha}`);
 
   const blobs: { path: string; sha: string }[] = [];
   for (const file of files) {
     const isBinary = !!file.contentBase64;
-    const blob = await gh<{ sha: string }>(`/repos/${OWNER}/${REPO}/git/blobs`, {
+    const blob = await gh<{ sha: string }>(`${await repositoryPath()}/git/blobs`, {
       method: 'POST',
       body: JSON.stringify({
         content: isBinary ? file.contentBase64 : file.content,
@@ -186,7 +206,7 @@ export async function pushFiles(branchName: string, baseSha: string, files: Push
     blobs.push({ path: file.path, sha: blob.sha });
   }
 
-  const newTree = await gh<{ sha: string }>(`/repos/${OWNER}/${REPO}/git/trees`, {
+  const newTree = await gh<{ sha: string }>(`${await repositoryPath()}/git/trees`, {
     method: 'POST',
     body: JSON.stringify({
       base_tree: baseCommit.tree.sha,
@@ -194,12 +214,12 @@ export async function pushFiles(branchName: string, baseSha: string, files: Push
     }),
   });
 
-  const newCommit = await gh<{ sha: string }>(`/repos/${OWNER}/${REPO}/git/commits`, {
+  const newCommit = await gh<{ sha: string }>(`${await repositoryPath()}/git/commits`, {
     method: 'POST',
     body: JSON.stringify({ message, tree: newTree.sha, parents: [baseSha] }),
   });
 
-  await gh(`/repos/${OWNER}/${REPO}/git/refs/heads/${branchName}`, {
+  await gh(`${await repositoryPath()}/git/refs/heads/${branchName}`, {
     method: 'PATCH',
     body: JSON.stringify({ sha: newCommit.sha, force: true }),
   });
@@ -208,7 +228,7 @@ export async function pushFiles(branchName: string, baseSha: string, files: Push
 }
 
 export async function dispatchWorkflow(workflowFile: string, ref: string, inputs: Record<string, string>): Promise<void> {
-  await gh(`/repos/${OWNER}/${REPO}/actions/workflows/${workflowFile}/dispatches`, {
+  await gh(`${await repositoryPath()}/actions/workflows/${workflowFile}/dispatches`, {
     method: 'POST',
     body: JSON.stringify({ ref, inputs }),
   });
@@ -222,7 +242,7 @@ export interface DispatchedRun {
 
 export async function findDispatchedRun(workflowFile: string, branchName: string, sinceIso: string): Promise<DispatchedRun | null> {
   const data = await gh<{ workflow_runs: { id: number; html_url: string; status: string; created_at: string }[] }>(
-    `/repos/${OWNER}/${REPO}/actions/workflows/${workflowFile}/runs?branch=${branchName}&per_page=5`,
+    `${await repositoryPath()}/actions/workflows/${workflowFile}/runs?branch=${branchName}&per_page=5`,
   );
   const candidates = data.workflow_runs.filter((r) => new Date(r.created_at) >= new Date(sinceIso));
   if (candidates.length === 0) return null;
@@ -231,16 +251,16 @@ export async function findDispatchedRun(workflowFile: string, branchName: string
 }
 
 export async function getRun(runId: number): Promise<{ status: string; conclusion: string | null; html_url: string }> {
-  return gh(`/repos/${OWNER}/${REPO}/actions/runs/${runId}`);
+  return gh(`${await repositoryPath()}/actions/runs/${runId}`);
 }
 
 export async function listArtifacts(runId: number): Promise<{ id: number; name: string }[]> {
-  const data = await gh<{ artifacts: { id: number; name: string }[] }>(`/repos/${OWNER}/${REPO}/actions/runs/${runId}/artifacts`);
+  const data = await gh<{ artifacts: { id: number; name: string }[] }>(`${await repositoryPath()}/actions/runs/${runId}/artifacts`);
   return data.artifacts;
 }
 
 export async function downloadArtifactZipBase64(artifactId: number): Promise<string> {
-  return ghBinaryBase64(`/repos/${OWNER}/${REPO}/actions/artifacts/${artifactId}/zip`);
+  return ghBinaryBase64(`${await repositoryPath()}/actions/artifacts/${artifactId}/zip`);
 }
 
 /**
@@ -255,7 +275,7 @@ export async function downloadArtifactZipToFile(
   destPath: string,
   onProgress?: (bytesWritten: number, bytesExpected: number) => void,
 ): Promise<void> {
-  const url = `${API_ROOT}/repos/${OWNER}/${REPO}/actions/artifacts/${artifactId}/zip`;
+  const url = `${API_ROOT}${await repositoryPath()}/actions/artifacts/${artifactId}/zip`;
   const downloadResumable = FileSystem.createDownloadResumable(
     url,
     destPath,
@@ -275,12 +295,12 @@ export async function downloadArtifactZipToFile(
 }
 
 export async function downloadRunLogsZipBase64(runId: number): Promise<string> {
-  return ghBinaryBase64(`/repos/${OWNER}/${REPO}/actions/runs/${runId}/logs`);
+  return ghBinaryBase64(`${await repositoryPath()}/actions/runs/${runId}/logs`);
 }
 
 export async function deleteArtifact(artifactId: number): Promise<void> {
   try {
-    await gh(`/repos/${OWNER}/${REPO}/actions/artifacts/${artifactId}`, { method: 'DELETE' });
+    await gh(`${await repositoryPath()}/actions/artifacts/${artifactId}`, { method: 'DELETE' });
   } catch {
     // Not fatal — artifacts also auto-expire.
   }
@@ -288,7 +308,7 @@ export async function deleteArtifact(artifactId: number): Promise<void> {
 
 export async function cancelRun(runId: number): Promise<void> {
   try {
-    await gh(`/repos/${OWNER}/${REPO}/actions/runs/${runId}/cancel`, { method: 'POST' });
+    await gh(`${await repositoryPath()}/actions/runs/${runId}/cancel`, { method: 'POST' });
   } catch {
     // Already completed — fine.
   }
@@ -302,13 +322,13 @@ export async function cancelRun(runId: number): Promise<void> {
  * "Retry" button on an already-finished build possible without re-uploading.
  */
 export async function rerunWorkflow(runId: number): Promise<void> {
-  await gh(`/repos/${OWNER}/${REPO}/actions/runs/${runId}/rerun`, { method: 'POST' });
+  await gh(`${await repositoryPath()}/actions/runs/${runId}/rerun`, { method: 'POST' });
 }
 
 /** Existence check only — used on resume to tell whether a push actually landed before the app died. */
 export async function fileExistsOnBranch(branchName: string, path: string): Promise<boolean> {
   try {
-    await gh(`/repos/${OWNER}/${REPO}/contents/${path}?ref=${branchName}`);
+    await gh(`${await repositoryPath()}/contents/${path}?ref=${branchName}`);
     return true;
   } catch {
     return false;

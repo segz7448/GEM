@@ -15,6 +15,9 @@ import {
 } from '@/lib/zipUtils';
 import { buildManifest, diffManifests, type ManifestDiff } from '@/lib/buildManifest';
 import { getLastCompletedBuildByAppName, type BuildProfile } from '@/lib/db';
+import { scanProject, type ScanResult } from '@/lib/projectScanner';
+import { validateBuildTarget } from '@/lib/githubClient';
+import { Icon } from '@/components/Icon';
 
 type PickedSource =
   | { kind: 'zip'; uri: string; name: string; sizeBytes: number }
@@ -25,6 +28,7 @@ export default function UploadScreen() {
   const router = useRouter();
   const [picked, setPicked] = useState<PickedSource | null>(null);
   const [reviewFiles, setReviewFiles] = useState<ProjectFile[] | null>(null);
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [diff, setDiff] = useState<ManifestDiff | null>(null);
   const [hasPreviousBuild, setHasPreviousBuild] = useState(false);
   const [ignoredFiles, setIgnoredFiles] = useState<ProjectFile[]>([]);
@@ -62,6 +66,7 @@ export default function UploadScreen() {
       }
 
       setReviewFiles(kept);
+      setScanResult(scanProject(kept));
       setIgnoredFiles(ignored);
 
       const appNameGuess = source.name.replace(/\.zip$/i, '');
@@ -194,6 +199,7 @@ export default function UploadScreen() {
   const reset = () => {
     setPicked(null);
     setReviewFiles(null);
+    setScanResult(null);
     setDiff(null);
     setHasPreviousBuild(false);
     setIgnoredFiles([]);
@@ -201,11 +207,26 @@ export default function UploadScreen() {
     setProfile('debug');
   };
 
+  const confirmPublicBuild = () => new Promise<boolean>((resolve) => {
+    Alert.alert(
+      'Public GitHub repository',
+      'This build uploads the project files and temporary build branch to a public repository. Anyone may be able to view that source. Continue only if this project can be public.',
+      [
+        { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+        { text: 'Continue', style: 'destructive', onPress: () => resolve(true) },
+      ],
+      { cancelable: true, onDismiss: () => resolve(false) },
+    );
+  });
+
   const startBuild = async () => {
     if (!picked) return;
     setStarting(true);
     try {
-      const buildId = await runBuild(picked.uri, picked.name, profile);
+      const targetCheck = await validateBuildTarget();
+      const publicTargetConfirmed = targetCheck.isPrivate ? false : await confirmPublicBuild();
+      if (!targetCheck.isPrivate && !publicTargetConfirmed) return;
+      const buildId = await runBuild(picked.uri, picked.name, profile, publicTargetConfirmed);
       router.replace(`/build/${buildId}`);
     } catch (err: any) {
       Alert.alert('Could not start build', err.message ?? 'Something went wrong.');
@@ -215,6 +236,7 @@ export default function UploadScreen() {
   };
 
   const anyBusy = preparing !== null || starting;
+  const scanBlocked = !scanResult || scanResult.type === 'unknown' || scanResult.issues.some((issue) => issue.severity === 'error');
 
   // Once a source is picked, show the review list (matching the "N files ready" screen)
   // instead of the three picker buttons.
@@ -248,25 +270,31 @@ export default function UploadScreen() {
               <Text className="text-gray-500 text-xs mb-3">{'First build of this app \u2014 nothing to compare against yet.'}</Text>
             )}
 
+            {scanResult && (
+              <View className="bg-surface border border-line rounded-xl p-3 mb-3">
+                <View className="flex-row items-start"><Icon name={scanBlocked ? 'alert-circle-outline' : 'check-circle-outline'} size={20} color={scanBlocked ? '#FB7185' : '#4ADE80'} style={{ marginRight: 8, marginTop: 1 }} /><Text className={`flex-1 ${scanBlocked ? 'text-danger font-semibold mb-1' : 'text-success font-semibold mb-1'}`}>{scanResult.summary}</Text></View>
+                {scanResult.signals.slice(0, 5).map((signal) => <View key={signal} className="flex-row items-center mb-1"><Icon name="check" size={13} color="#70C79A" style={{ marginRight: 6 }} /><Text className="text-gray-400 text-xs flex-1">{signal}</Text></View>)}
+                {scanResult.signals.length > 5 && <Text className="text-gray-500 text-xs">and {scanResult.signals.length - 5} more signals</Text>}
+                {scanResult.issues.map((issue, i) => <Text key={`${issue.file ?? 'issue'}-${i}`} className={issue.severity === 'error' ? 'text-danger text-xs mt-1' : 'text-warn text-xs mt-1'}>{issue.severity.toUpperCase()}: {issue.message}{issue.file ? ` (${issue.file})` : ''}</Text>)}
+              </View>
+            )}
+
             {ignoredFiles.length > 0 && (
-              <Pressable onPress={() => setIgnoredExpanded((v) => !v)} className="mb-3">
-                <Text className="text-gray-500 text-xs">
-                  {ignoredExpanded ? '\u25be' : '\u25b8'} {ignoredFiles.length} file{ignoredFiles.length === 1 ? '' : 's'} ignored
-                  (node_modules, .git, build output, etc.)
-                </Text>
+              <View className="mb-3">
+                <Pressable onPress={() => setIgnoredExpanded((v) => !v)} className="flex-row items-center py-2">
+                  <Icon name={ignoredExpanded ? 'chevron-down' : 'chevron-right'} size={16} color="#777487" style={{ marginRight: 5 }} />
+                  <Icon name="filter-variant" size={15} color="#777487" style={{ marginRight: 5 }} />
+                  <Text className="text-gray-500 text-xs">{ignoredFiles.length} file{ignoredFiles.length === 1 ? '' : 's'} ignored (node_modules, .git, build output)</Text>
+                </Pressable>
                 {ignoredExpanded && (
-                  <View className="bg-surface rounded-xl p-3 mt-2">
+                  <View className="bg-surface border border-line rounded-xl p-3 mt-1">
                     {ignoredFiles.slice(0, 50).map((f) => (
-                      <Text key={f.path} className="text-gray-600 text-xs mb-1" numberOfLines={1}>
-                        {f.path}
-                      </Text>
+                      <Text key={f.path} className="text-gray-500 text-xs mb-1" numberOfLines={1}>{f.path}</Text>
                     ))}
-                    {ignoredFiles.length > 50 && (
-                      <Text className="text-gray-600 text-xs">{`\u2026 and ${ignoredFiles.length - 50} more`}</Text>
-                    )}
+                    {ignoredFiles.length > 50 && <Text className="text-gray-500 text-xs">… and {ignoredFiles.length - 50} more</Text>}
                   </View>
                 )}
-              </Pressable>
+              </View>
             )}
 
             <View className="flex-row mb-3 bg-surface rounded-xl p-1">
@@ -274,13 +302,13 @@ export default function UploadScreen() {
                 onPress={() => setProfile('debug')}
                 className={`flex-1 rounded-lg py-2 items-center ${profile === 'debug' ? 'bg-accent' : ''}`}
               >
-                <Text className={profile === 'debug' ? 'text-white font-semibold' : 'text-gray-400'}>Debug</Text>
+                <View className="flex-row items-center"><Icon name="bug-outline" size={17} color={profile === 'debug' ? '#FFFFFF' : '#A9A6B8'} style={{ marginRight: 6 }} /><Text className={profile === 'debug' ? 'text-white font-semibold' : 'text-gray-400'}>Debug</Text></View>
               </Pressable>
               <Pressable
                 onPress={() => setProfile('release')}
                 className={`flex-1 rounded-lg py-2 items-center ${profile === 'release' ? 'bg-accent' : ''}`}
               >
-                <Text className={profile === 'release' ? 'text-white font-semibold' : 'text-gray-400'}>Release</Text>
+                <View className="flex-row items-center"><Icon name="shield-check-outline" size={17} color={profile === 'release' ? '#FFFFFF' : '#A9A6B8'} style={{ marginRight: 6 }} /><Text className={profile === 'release' ? 'text-white font-semibold' : 'text-gray-400'}>Release</Text></View>
               </Pressable>
             </View>
             {profile === 'release' && (
@@ -307,10 +335,10 @@ export default function UploadScreen() {
             />
             <View className="flex-row gap-3">
               <Pressable onPress={reset} disabled={starting} className="flex-1 border border-gray-600 rounded-2xl py-4 items-center">
-                <Text className="text-white">Choose Different Source</Text>
+                <View className="flex-row items-center"><Icon name="folder-swap-outline" size={18} color="#FFFFFF" style={{ marginRight: 7 }} /><Text className="text-white">Choose different source</Text></View>
               </Pressable>
-              <Pressable onPress={startBuild} disabled={starting} className="flex-1 bg-accent rounded-2xl py-4 items-center">
-                {starting ? <ActivityIndicator color="#fff" /> : <Text className="text-white font-semibold">Start Build</Text>}
+              <Pressable onPress={startBuild} disabled={starting || scanBlocked} className={`flex-1 rounded-2xl py-4 items-center ${scanBlocked ? 'bg-gray-700' : 'bg-accent'}`}>
+                {starting ? <ActivityIndicator color="#fff" /> : <View className="flex-row items-center"><Icon name={scanBlocked ? 'alert-outline' : 'rocket-launch-outline'} size={19} color="#FFFFFF" style={{ marginRight: 7 }} /><Text className="text-white font-semibold">{scanBlocked ? 'Fix scan errors first' : 'Build APK'}</Text></View>}
               </Pressable>
             </View>
           </>
@@ -320,35 +348,36 @@ export default function UploadScreen() {
   }
 
   return (
-    <View className="flex-1 bg-base px-4 pt-4">
+    <View className="flex-1 bg-base px-5 pt-5">
+      <View className="flex-row items-center mb-5"><View className="w-11 h-11 rounded-2xl bg-accent/20 items-center justify-center mr-3"><Icon name="rocket-launch-outline" size={22} color="#B6A7FF" /></View><View><Text className="text-white text-xl font-bold">New Android build</Text><Text className="text-gray-500 text-xs mt-0.5">Select source to scan before building</Text></View></View>
       <Pressable
         onPress={pickZip}
         disabled={anyBusy}
         className="bg-accent rounded-2xl py-4 items-center mb-3"
       >
-        {preparing === 'zip' ? <ActivityIndicator color="#fff" /> : <Text className="text-white text-base font-semibold">Choose ZIP File</Text>}
+        {preparing === 'zip' ? <ActivityIndicator color="#fff" /> : <View className="flex-row items-center"><Icon name="archive-outline" size={21} color="#fff" style={{ marginRight: 9 }} /><Text className="text-white text-base font-semibold">Choose ZIP file</Text></View>}
       </Pressable>
 
       <Pressable
         onPress={pickFiles}
         disabled={anyBusy}
-        className="border border-gray-600 rounded-2xl py-4 items-center mb-3"
+        className="bg-surface border border-line rounded-2xl py-4 items-center mb-3"
       >
-        {preparing === 'files' ? <ActivityIndicator color="#fff" /> : <Text className="text-white text-base">Choose Files</Text>}
+        {preparing === 'files' ? <ActivityIndicator color="#fff" /> : <View className="flex-row items-center"><Icon name="file-multiple-outline" size={21} color="#A9A6B8" style={{ marginRight: 9 }} /><Text className="text-white text-base">Choose files</Text></View>}
       </Pressable>
 
       <Pressable
         onPress={pickFolder}
         disabled={anyBusy}
-        className="border border-gray-600 rounded-2xl py-4 items-center mb-4"
+        className="bg-surface border border-line rounded-2xl py-4 items-center mb-4"
       >
-        {preparing === 'folder' ? <ActivityIndicator color="#fff" /> : <Text className="text-white text-base">Choose Folder</Text>}
+        {preparing === 'folder' ? <ActivityIndicator color="#fff" /> : <View className="flex-row items-center"><Icon name="folder-open-outline" size={21} color="#A9A6B8" style={{ marginRight: 9 }} /><Text className="text-white text-base">Choose folder</Text></View>}
       </Pressable>
 
-      <Text className="text-gray-500 text-sm text-center mb-6">
+      <View className="flex-row items-start px-2"><Icon name="information-outline" size={17} color="#777487" style={{ marginRight: 7, marginTop: 2 }} /><Text className="text-gray-500 text-sm text-center mb-6 flex-1">
         Upload a ZIP archive, pick individual files, or select a whole folder to upload with its structure preserved.
         Nothing is uploaded until you confirm the build below.
-      </Text>
+      </Text></View>
     </View>
   );
 }

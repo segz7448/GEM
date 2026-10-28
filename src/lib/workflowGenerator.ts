@@ -39,76 +39,42 @@ function gradleCacheStep(): string {
  * reference these same secret names themselves; GEM can't safely rewrite
  * an uploaded build.gradle without risking breaking it.
  *
- * All four secrets — ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
- * ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD — are optional. If unset, the
- * signing_args step just emits an empty string and the build falls back to
- * an unsigned release artifact rather than failing outright.
+ * Uses the existing GEM repo secret names RELEASE_KEYSTORE_BASE64,
+ * RELEASE_STORE_PASSWORD, RELEASE_KEY_ALIAS and RELEASE_KEY_PASSWORD.
+ * If any is missing, release builds fall back to the project's default signing.
  */
 function releaseSigningSteps(): string {
-  return '      - name: Decode signing keystore\n' +
+  return '      - name: Decode release keystore when fully configured\n' +
     '        id: keystore\n' +
-    "        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}\n" +
-    '        run: |\n' +
-    '          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"\n' +
-    '          echo "path=$RUNNER_TEMP/release.keystore" >> "$GITHUB_OUTPUT"\n' +
     '        env:\n' +
-    '          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n' +
-    '\n' +
-    '      - name: Prepare release signing arguments\n' +
-    '        id: signing_args\n' +
+    '          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}\n' +
+    '          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}\n' +
+    '          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}\n' +
+    '          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}\n' +
     '        run: |\n' +
-    '          if [ -n "$KEYSTORE_PATH" ]; then\n' +
-    '            echo "args=-Pandroid.injected.signing.store.file=$KEYSTORE_PATH -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD -Pandroid.injected.signing.key.alias=$KEY_ALIAS -Pandroid.injected.signing.key.password=$KEY_PASSWORD" >> "$GITHUB_OUTPUT"\n' +
+    '          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_STORE_PASSWORD" ] && [ -n "$RELEASE_KEY_ALIAS" ] && [ -n "$RELEASE_KEY_PASSWORD" ]; then\n' +
+    '            echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"\n' +
     '          else\n' +
-    '            echo "No signing keystore configured — release artifact will be unsigned. Add ANDROID_KEYSTORE_BASE64 etc. in Secrets to sign it." >&2\n' +
-    '            echo "args=" >> "$GITHUB_OUTPUT"\n' +
-    '          fi\n' +
-    '        env:\n' +
-    '          KEYSTORE_PATH: ${{ steps.keystore.outputs.path }}\n' +
-    '          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}\n' +
-    '          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n' +
-    '          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}\n';
+    '            echo "Release signing secrets are incomplete; this release will use default signing." >&2\n' +
+    '          fi\n';
 }
 
-/**
- * Push notifications, no backend.
- *
- * The GitHub Actions runner itself calls FCM directly - there's no webhook
- * receiver, no server, no Cloud Function. The runner already knows exactly
- * when the build starts, succeeds, or fails, so it just POSTs to Google's
- * FCM HTTP v1 API in those moments.
- *
- * FCM's legacy server-key API was fully shut down in 2024 - HTTP v1 requires
- * a short-lived OAuth2 access token, minted here from a service account key
- * using Google's official `google-auth` Python library (preinstalled on
- * GitHub-hosted runners' Python, well-documented, stable contract - safer
- * than depending on a third-party auth Action's exact behavior).
- *
- * Two repo secrets required (see README/Settings screen for setup steps):
- *   - FIREBASE_SERVICE_ACCOUNT_JSON: full contents of a Firebase service
- *     account key (Firebase Console -> Project Settings -> Service accounts
- *     -> Generate new private key). Its project_id field is reused directly,
- *     so no separate FIREBASE_PROJECT_ID secret is needed.
- *   - FCM_DEVICE_TOKEN: the phone's FCM device token, copyable from GEM's
- *     Settings screen. Static single-device token, not a rotating backend -
- *     if it ever changes (reinstall, data clear), just re-copy it in.
- *
- * Every notify step has `continue-on-error: true` - a notification hiccup
- * must never break the actual build.
- */
 function fcmAuthAndStartStep(): string {
   return `      - name: Authenticate to Firebase Cloud Messaging
         id: fcm_auth
-        if: \${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON != '' }}
         continue-on-error: true
         run: |
           pip install --quiet google-auth
           python3 - <<'PYEOF'
-          import json, os
+          import json, os, sys
           from google.oauth2 import service_account
           from google.auth.transport.requests import Request
 
-          info = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"])
+          raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+          if not raw:
+              print("FCM credentials are not configured; notifications are disabled.")
+              sys.exit(0)
+          info = json.loads(raw)
           creds = service_account.Credentials.from_service_account_info(
               info, scopes=["https://www.googleapis.com/auth/firebase.messaging"]
           )
@@ -121,7 +87,7 @@ function fcmAuthAndStartStep(): string {
           FIREBASE_SERVICE_ACCOUNT_JSON: \${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
 
       - name: Notify build started (FCM)
-        if: steps.fcm_auth.outcome == 'success'
+        if: steps.fcm_auth.outputs.access_token != ''
         continue-on-error: true
         run: |
           curl -sS -X POST \\
@@ -144,7 +110,7 @@ function fcmAuthAndStartStep(): string {
 
 function notifySuccessStep(): string {
   return `      - name: Notify build succeeded (FCM)
-        if: success() && steps.fcm_auth.outcome == 'success'
+        if: success() && steps.fcm_auth.outputs.access_token != ''
         continue-on-error: true
         run: |
           curl -sS -X POST \\
@@ -167,7 +133,7 @@ function notifySuccessStep(): string {
 
 function notifyFailureStep(): string {
   return `      - name: Notify build failed (FCM)
-        if: failure() && steps.fcm_auth.outcome == 'success'
+        if: failure() && steps.fcm_auth.outputs.access_token != ''
         continue-on-error: true
         run: |
           RUN_URL="\${{ github.server_url }}/\${{ github.repository }}/actions/runs/\${{ github.run_id }}"
@@ -264,9 +230,21 @@ function uploadStep(profile: BuildProfile): string {
 /** `assembleDebug` for debug builds; signed `assembleRelease bundleRelease` (APK + AAB) for release. */
 function gradleBuildStep(profile: BuildProfile, gradlewInvocation: string): string {
   if (profile === 'release') {
+    const base = gradlewInvocation + ' assembleRelease bundleRelease';
     return (
       '      - name: Build release APK + AAB\n' +
-      '        run: ' + gradlewInvocation + ' assembleRelease bundleRelease ${{ steps.signing_args.outputs.args }} --stacktrace\n'
+      '        env:\n' +
+      '          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}\n' +
+      '          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}\n' +
+      '          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}\n' +
+      '          RELEASE_STORE_FILE: $RUNNER_TEMP/release.keystore\n' +
+      '        run: |\n' +
+      '          if [ -f "$RUNNER_TEMP/release.keystore" ]; then\n' +
+      '            ' + base + ' -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.keystore" -Pandroid.injected.signing.store.password="$RELEASE_STORE_PASSWORD" -Pandroid.injected.signing.key.alias="$RELEASE_KEY_ALIAS" -Pandroid.injected.signing.key.password="$RELEASE_KEY_PASSWORD" --stacktrace\n' +
+      '          else\n' +
+      '            echo "Release keystore secrets incomplete; building unsigned release." >&2\n' +
+      '            ' + base + ' --stacktrace\n' +
+      '          fi\n'
     );
   }
   return '      - name: Build debug APK\n' + '        run: ' + gradlewInvocation + ' assembleDebug --stacktrace\n';
@@ -391,10 +369,76 @@ function flutterAndroid(profile: BuildProfile): string {
   );
 }
 
+function capacitorAndroid(profile: BuildProfile): string {
+  return (
+    header() +
+    '\n' +
+    '      - name: Setup Node.js\n' +
+    '        uses: actions/setup-node@v4\n' +
+    '        with:\n' +
+    "          node-version: '20'\n" +
+    "          cache: 'npm'\n" +
+    '\n' +
+    '      - name: Install dependencies\n' +
+    '        run: npm install\n' +
+    '\n' +
+    '      - name: Ensure Android platform exists\n' +
+    '        run: |\n' +
+    '          if [ ! -d android ]; then npx cap add android; fi\n' +
+    '          npx cap sync android\n' +
+    '\n' +
+    '      - name: Grant execute permission for gradlew\n' +
+    '        run: chmod +x android/gradlew\n' +
+    '\n' +
+    gradleCacheStep() +
+    (profile === 'release' ? '\n' + releaseSigningSteps() : '') +
+    '\n' +
+    gradleBuildStep(profile, 'cd android && ./gradlew') +
+    uploadStep(profile) +
+    notifyFailureStep()
+  );
+}
+
+function cordovaAndroid(profile: BuildProfile): string {
+  const buildCommand = profile === 'release' ? 'assembleRelease bundleRelease' : 'assembleDebug';
+  return (
+    header() +
+    '\n' +
+    '      - name: Setup Node.js\n' +
+    '        uses: actions/setup-node@v4\n' +
+    '        with:\n' +
+    "          node-version: '20'\n" +
+    "          cache: 'npm'\n" +
+    '\n' +
+    '      - name: Install dependencies\n' +
+    '        run: npm install\n' +
+    '\n' +
+    '      - name: Ensure Android platform exists\n' +
+    '        run: |\n' +
+    '          if [ ! -d platforms/android ]; then npx cordova platform add android; fi\n' +
+    '          npx cordova prepare android\n' +
+    '\n' +
+    '      - name: Grant execute permission for gradlew\n' +
+    '        run: chmod +x platforms/android/gradlew\n' +
+    '\n' +
+    gradleCacheStep() +
+    (profile === 'release' ? '\n' + releaseSigningSteps() : '') +
+    '\n' +
+    '      - name: Build Android APK\n' +
+    '        run: cd platforms/android && ./gradlew ' + buildCommand + ' --stacktrace\n' +
+    uploadStep(profile) +
+    notifyFailureStep()
+  );
+}
+
 export function generateWorkflow(type: ProjectType, profile: BuildProfile = 'debug'): string {
   switch (type) {
     case 'expo-managed':
       return expoManagedAndroid(profile);
+    case 'capacitor':
+      return capacitorAndroid(profile);
+    case 'cordova':
+      return cordovaAndroid(profile);
     case 'react-native':
       return reactNativeAndroid(profile);
     case 'flutter':
