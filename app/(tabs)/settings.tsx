@@ -1,5 +1,6 @@
 import { View, Text, TextInput, Pressable, ScrollView, Alert, ActivityIndicator } from 'react-native';
 import { getBuildTargetDraft, saveBuildTarget, type BuildTarget } from '@/lib/buildTarget';
+import { getGithubToken, saveGithubToken, clearGithubToken, testGithubToken } from '@/lib/githubToken';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'expo-router';
 import * as FileSystem from 'expo-file-system';
@@ -76,6 +77,68 @@ function ProviderRow({ id, label, defaultModel }: { id: AiProvider; label: strin
           <View className="flex-row items-center"><Icon name="content-save-outline" size={16} color="#fff" style={{ marginRight: 6 }} /><Text className="text-white font-medium">Save</Text></View>
         </Pressable>
         <Pressable onPress={test} disabled={!apiKey || testing} className="bg-base border border-gray-600 rounded-xl px-4 py-2">
+          {testing ? <ActivityIndicator size="small" color="#fff" /> : <View className="flex-row items-center"><Icon name="connection" size={16} color="#fff" style={{ marginRight: 6 }} /><Text className="text-white">Test</Text></View>}
+        </Pressable>
+      </View>
+      {result && <View className="flex-row items-center mt-2"><Icon name={/saved|cleared|connected/i.test(result) ? 'check-circle-outline' : 'alert-circle-outline'} size={16} color={/saved|cleared|connected/i.test(result) ? '#4ADE80' : '#FBBF24'} style={{ marginRight: 6 }} /><Text className="text-gray-400 text-sm flex-1">{result}</Text></View>}
+    </View>
+  );
+}
+
+function GithubTokenRow() {
+  const [token, setToken] = useState('');
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+
+  useEffect(() => {
+    getGithubToken().then(setToken);
+  }, []);
+
+  const save = async () => {
+    if (!token.trim()) {
+      await clearGithubToken();
+      setResult('Cleared.');
+      return;
+    }
+    try {
+      await saveGithubToken(token);
+      setResult('Saved on this device.');
+    } catch (err: any) {
+      setResult(err?.message ?? 'Could not save the token.');
+    }
+  };
+
+  const test = async () => {
+    if (!token.trim()) return;
+    setTesting(true);
+    setResult(null);
+    const res = await testGithubToken(token);
+    setResult(res.message);
+    setTesting(false);
+  };
+
+  return (
+    <View className="bg-surface border border-line rounded-2xl p-4 mb-4">
+      <Text className="text-gray-400 text-sm mb-3">
+        Builds, artifact downloads and repo secrets all authenticate with this token. It is stored only in this
+        phone's secure storage - never in the repository, where GitHub's scanner would revoke it. Use a token with
+        repo and workflow access (or a fine-grained token with Contents, Actions and Secrets read/write on the build
+        repo).
+      </Text>
+      <TextInput
+        placeholder="GitHub personal access token"
+        placeholderTextColor="#666"
+        value={token}
+        onChangeText={setToken}
+        secureTextEntry
+        autoCapitalize="none"
+        className="bg-base text-white rounded-xl px-3 py-2 mb-3"
+      />
+      <View className="flex-row items-center">
+        <Pressable onPress={save} className="bg-accent rounded-xl px-4 py-2 mr-3">
+          <View className="flex-row items-center"><Icon name="content-save-outline" size={16} color="#fff" style={{ marginRight: 6 }} /><Text className="text-white font-medium">Save</Text></View>
+        </Pressable>
+        <Pressable onPress={test} disabled={!token.trim() || testing} className="bg-base border border-gray-600 rounded-xl px-4 py-2">
           {testing ? <ActivityIndicator size="small" color="#fff" /> : <View className="flex-row items-center"><Icon name="connection" size={16} color="#fff" style={{ marginRight: 6 }} /><Text className="text-white">Test</Text></View>}
         </Pressable>
       </View>
@@ -180,6 +243,9 @@ export default function SettingsScreen() {
   return (
     <ScrollView className="flex-1 bg-base px-5 pt-5">
       <View className="flex-row items-center mb-1"><View className="w-11 h-11 rounded-2xl bg-accent/20 items-center justify-center mr-3"><Icon name="tune-variant" size={22} color="#B6A7FF" /></View><View><Text className="text-white text-xl font-bold">Settings</Text><Text className="text-gray-500 text-xs mt-0.5">Build access, alerts and storage</Text></View></View>
+      <View className="flex-row items-center mt-6 mb-3"><Icon name="key-outline" size={20} color="#A78BFA" style={{ marginRight: 8 }} /><Text className="text-white text-lg font-semibold">GitHub Token</Text></View>
+      <GithubTokenRow />
+
       <View className="flex-row items-center mt-6 mb-3"><Icon name="source-repository" size={20} color="#A78BFA" style={{ marginRight: 8 }} /><Text className="text-white text-lg font-semibold">GitHub Build Target</Text></View>
       <View className="bg-surface border border-line rounded-2xl p-4 mb-4">
         <Text className="text-gray-400 text-sm mb-3">GEM can build in this repository or another repository. Uploaded project files and temporary branches are public if this repo is public; you'll confirm before each public build. The repo needs a base branch and GitHub Actions enabled.</Text>

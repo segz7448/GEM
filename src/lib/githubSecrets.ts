@@ -1,9 +1,6 @@
-import Constants from 'expo-constants';
 import * as sealedbox from 'tweetnacl-sealedbox-js';
 import { getBuildTarget } from './buildTarget';
-
-const extra = Constants.expoConfig?.extra ?? {};
-const TOKEN: string = extra.GITHUB_TOKEN ?? '';
+import { requireGithubToken } from './githubToken';
 
 const API_ROOT = 'https://api.github.com';
 
@@ -27,10 +24,11 @@ async function repositoryPath(): Promise<string> {
  */
 
 async function gh<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = await requireGithubToken();
   const res = await fetch(`${API_ROOT}${path}`, {
     ...init,
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),

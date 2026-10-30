@@ -1,9 +1,6 @@
-import Constants from 'expo-constants';
 import * as FileSystem from 'expo-file-system';
 import { getBuildTarget } from './buildTarget';
-
-const extra = Constants.expoConfig?.extra ?? {};
-const TOKEN: string = extra.GITHUB_TOKEN ?? '';
+import { requireGithubToken } from './githubToken';
 
 
 const API_ROOT = 'https://api.github.com';
@@ -14,10 +11,11 @@ async function repositoryPath(): Promise<string> {
 }
 
 async function gh<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = await requireGithubToken();
   const res = await fetch(`${API_ROOT}${path}`, {
     ...init,
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
@@ -35,9 +33,10 @@ async function gh<T>(path: string, init?: RequestInit): Promise<T> {
 
 /** Fetches a binary endpoint (artifact/log zips) and returns a base64 string, since RN has no ArrayBuffer-to-file shortcut without one. */
 async function ghBinaryBase64(path: string): Promise<string> {
+  const token = await requireGithubToken();
   const res = await fetch(`${API_ROOT}${path}`, {
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
     },
@@ -275,13 +274,14 @@ export async function downloadArtifactZipToFile(
   destPath: string,
   onProgress?: (bytesWritten: number, bytesExpected: number) => void,
 ): Promise<void> {
+  const token = await requireGithubToken();
   const url = `${API_ROOT}${await repositoryPath()}/actions/artifacts/${artifactId}/zip`;
   const downloadResumable = FileSystem.createDownloadResumable(
     url,
     destPath,
     {
       headers: {
-        Authorization: `Bearer ${TOKEN}`,
+        Authorization: `Bearer ${token}`,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
       },
