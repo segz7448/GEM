@@ -6,6 +6,10 @@ on:
       build_id:
         required: true
         type: string
+      app_name:
+        required: false
+        type: string
+        default: 'your app'
 
 jobs:
   build:
@@ -14,25 +18,94 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Authenticate to Firebase Cloud Messaging
+        id: fcm_auth
+        continue-on-error: true
+        run: |
+          pip install --quiet google-auth
+          python3 - <<'PYEOF'
+          import json, os, sys
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+
+          raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+          if not raw:
+              print("FCM credentials are not configured; notifications are disabled.")
+              sys.exit(0)
+          info = json.loads(raw)
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=["https://www.googleapis.com/auth/firebase.messaging"]
+          )
+          creds.refresh(Request())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"access_token={creds.token}\n")
+              f.write(f"project_id={info['project_id']}\n")
+          PYEOF
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Notify build started (FCM)
+        if: steps.fcm_auth.outputs.access_token != ''
+        continue-on-error: true
+        run: |
+          curl -sS -X POST \
+            "https://fcm.googleapis.com/v1/projects/${{ steps.fcm_auth.outputs.project_id }}/messages:send" \
+            -H "Authorization: Bearer ${{ steps.fcm_auth.outputs.access_token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "message": {
+                "token": "${{ secrets.FCM_DEVICE_TOKEN }}",
+                "notification": {
+                  "title": "GEM build started",
+                  "body": "Building ${{ inputs.app_name }}\u2026"
+                },
+                "data": { "buildId": "${{ inputs.build_id }}", "status": "started" },
+                "android": { "priority": "high" }
+              }
+            }'
+
       - name: Setup JDK
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Generate Gradle wrapper if missing
-        run: |
-          if [ ! -f "./gradlew" ]; then
-            echo "gradlew not found in upload — generating with the runner's system Gradle."
-            gradle wrapper --gradle-version 8.7
-          fi
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Align Expo package versions with SDK
+        # Catches mismatched expo-* module versions (compiles fine,
+        # throws NoSuchMethodError/NoClassDefFoundError against
+        # expo-modules-core at runtime instead) before they reach a build.
+        run: npx expo install --fix
+
+      - name: Prebuild native Android project
+        # Generates android/ from app.json + config plugins. Runs
+        # entirely locally on the runner - no Expo account, token, or
+        # cloud service involved.
+        run: npx expo prebuild --platform android --clean --no-install
 
       - name: Grant execute permission for gradlew
-        run: chmod +x ./gradlew
+        run: chmod +x android/gradlew
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --stacktrace
-
+        run: cd android && ./gradlew assembleDebug --stacktrace
       - name: Locate APK
         id: apk
         run: |
@@ -49,3 +122,43 @@ jobs:
           name: gem-build-${{ inputs.build_id }}
           path: ${{ steps.apk.outputs.path }}
           retention-days: 1
+
+      - name: Notify build succeeded (FCM)
+        if: success() && steps.fcm_auth.outputs.access_token != ''
+        continue-on-error: true
+        run: |
+          curl -sS -X POST \
+            "https://fcm.googleapis.com/v1/projects/${{ steps.fcm_auth.outputs.project_id }}/messages:send" \
+            -H "Authorization: Bearer ${{ steps.fcm_auth.outputs.access_token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "message": {
+                "token": "${{ secrets.FCM_DEVICE_TOKEN }}",
+                "notification": {
+                  "title": "${{ inputs.app_name }} build ready",
+                  "body": "Your APK finished building - tap to download."
+                },
+                "data": { "buildId": "${{ inputs.build_id }}", "status": "success" },
+                "android": { "priority": "high" }
+              }
+            }'
+      - name: Notify build failed (FCM)
+        if: failure() && steps.fcm_auth.outputs.access_token != ''
+        continue-on-error: true
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST \
+            "https://fcm.googleapis.com/v1/projects/${{ steps.fcm_auth.outputs.project_id }}/messages:send" \
+            -H "Authorization: Bearer ${{ steps.fcm_auth.outputs.access_token }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "message": {
+                "token": "${{ secrets.FCM_DEVICE_TOKEN }}",
+                "notification": {
+                  "title": "${{ inputs.app_name }} build failed",
+                  "body": "Tap to see the failed step in the run log."
+                },
+                "data": { "buildId": "${{ inputs.build_id }}", "status": "failed", "runUrl": "'"$RUN_URL"'" },
+                "android": { "priority": "high" }
+              }
+            }'
