@@ -1,0 +1,1715 @@
+/**
+ * ZAO - Backend Client
+ *
+ * The backend runs on a dedicated, always-on Alibaba Cloud VM (see
+ * /server in the repo root) instead of on-device or on a person's PC -
+ * the VM relays chat completions to OpenRouter (currently stealth/
+ * ox-alpha, see server/config.js's header comment) and also hosts the
+ * Terminal/Filesystem/Office tools directly against its own Linux
+ * filesystem.
+ *
+ * CONNECTION: a single fixed address, configured once in Settings >
+ * Server Connection:
+ *   - VM IP (or IP:port), e.g. http://123.45.67.89:8000 - the VM is
+ *     24/7, so there's no LAN/Remote toggle and nothing that rotates.
+ * Every request carries an Authorization: Bearer <token> header - the
+ * VM's own shared secret (labeled "Model API key" in Settings for
+ * historical reasons, but it's not the model provider's key - see
+ * OPENROUTER_API_KEY below), matching AUTH_TOKEN in the VM's
+ * server/config.js - since the backend is reachable over the public
+ * internet, not just loopback. Separately, an `X-OpenRouter-Key` header
+ * (see authHeaders() below) carries the person's own OpenRouter key,
+ * entered in Settings > Server Connection > OpenRouter API key - that's
+ * the one that actually reaches the model.
+ *
+ * CONTRACT: sendMessage() keeps the same shape used throughout the app -
+ * { success, data: { content, toolCalls, raw }, error } - so
+ * orchestrator.js, toolOrchestrator.js, and memoryEngine.js need no
+ * changes beyond whatever already imports this file. (The browser agent
+ * doesn't call through here - see server/browserAgent.js, which talks to
+ * the model server directly on the VM.)
+ */
+
+import { usePreferencesStore } from '../../store/preferencesStore';
+import { streamSSE } from '../../utils/sseClient';
+
+const HEALTH_TIMEOUT_MS = 4 * 1000;
+const COMPLETION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes - PC CPU inference is faster than phone, but still not instant, and LAN/tunnel hops add latency
+const TERMINAL_TIMEOUT_MS = 2 * 60 * 1000;
+const WEB_SEARCH_TIMEOUT_MS = 20 * 1000; // small buffer over the server's own SEARCH_TIMEOUT_MS (15s)
+const WEB_FETCH_TIMEOUT_MS = 25 * 1000; // small buffer over the server's own FETCH_TIMEOUT_MS (20s)
+const SESSION_TIMEOUT_MS = 15 * 1000; // these calls only start/poll a session or fetch its status - the actual work runs unbounded server-side
+
+const ERROR_TYPES = {
+  BACKEND_UNREACHABLE: 'BACKEND_UNREACHABLE',
+  MODEL_LOADING: 'MODEL_LOADING',
+  BAD_REQUEST: 'BAD_REQUEST',
+  INFERENCE_ERROR: 'INFERENCE_ERROR',
+  NOT_CONFIGURED: 'NOT_CONFIGURED',
+  UNKNOWN: 'UNKNOWN',
+};
+
+/**
+ * Resolves the VM's base URL + model API key from preferences. Returns
+ * null for baseUrl if it hasn't been configured yet in Settings > Server
+ * Connection, so callers can show a clear "not configured" error instead
+ * of a confusing network failure.
+ */
+function getActiveConnection() {
+  const prefs = usePreferencesStore.getState().preferences || {};
+  const baseUrl = prefs.backend_vm_url || null;
+  return {
+    // Kept as a fixed constant (rather than removed) purely for call-site
+    // compatibility - every function below still destructures `mode` out
+    // of this object. There's only one connection now (the VM), so it's
+    // otherwise unused.
+    mode: 'vm',
+    baseUrl: baseUrl ? baseUrl.replace(/\/+$/, '') : null,
+    token: prefs.backend_auth_token || null,
+    // The person's own OpenRouter key, entered in Settings > Server
+    // Connection > OpenRouter API key (OpenRouterApiKeySection). Separate
+    // from `token` above, which still gates access to the VM itself -
+    // this is what the VM then uses to call OpenRouter on the model's
+    // behalf. See server/config.js's header comment for the full picture.
+    openrouterKey: prefs.openrouter_api_key || null,
+  };
+}
+
+/**
+ * Every authenticated request to the VM carries both headers: `token`
+ * (Authorization: Bearer ...) is the VM's own shared secret, unchanged
+ * from before. `X-OpenRouter-Key`, when set, is the person's OpenRouter
+ * key - harmless to attach to routes that don't need it (terminal, git,
+ * filesystem, etc.), and it's what lets server/index.js's chat-completion
+ * relay (and its cached-key fallback for browser-agent/background-session
+ * calls) actually reach OpenRouter. Reads directly from the preferences
+ * store rather than taking a second parameter, so none of the ~25
+ * existing `authHeaders(token)` call sites throughout this file needed to
+ * change.
+ */
+function authHeaders(token) {
+  const { openrouterKey } = getActiveConnection();
+  const headers = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (openrouterKey) headers['X-OpenRouter-Key'] = openrouterKey;
+  return headers;
+}
+
+function withTimeout(promise, ms, timeoutMessage) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Pings the VM's /health endpoint using whichever connection (baseUrl +
+ * token) is currently saved in preferences. Used at app launch/
+ * foreground, by Settings to show a live connection indicator, and by
+ * terminalRouter.js to decide connection status - never throws.
+ * @returns {Promise<{connected: boolean, ready: boolean, model: string|null, mode: string, internetAvailable: boolean|null}>}
+ */
+export async function checkBackendHealth() {
+  const { mode, baseUrl } = getActiveConnection();
+  if (!baseUrl) {
+    return { connected: false, ready: false, model: null, mode, internetAvailable: null };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/health`),
+      HEALTH_TIMEOUT_MS,
+      'Health check timed out'
+    );
+    if (!response.ok) {
+      return { connected: false, ready: false, model: null, mode, internetAvailable: null };
+    }
+    const json = await response.json();
+    return {
+      connected: true,
+      ready: json.status === 'ready',
+      model: json.model || null,
+      mode,
+      // Whether the VM itself currently has internet access (distinct from
+      // "is the VM backend reachable", which connected:true already
+      // covers) - see server/index.js's refreshInternetStatus(). null
+      // means the VM backend hasn't completed its first check yet.
+      internetAvailable: typeof json.internetAvailable === 'boolean' ? json.internetAvailable : null,
+    };
+  } catch (err) {
+    return { connected: false, ready: false, model: null, mode, internetAvailable: null };
+  }
+}
+
+/**
+ * Tests a VM IP/URL and/or model API key BEFORE they're saved to
+ * preferences - what Settings > Server Connection's two "Test & Save"
+ * buttons call. Pass just `url` to test reachability only (no
+ * Authorization header sent, so this works even before a key exists);
+ * pass `url` + `token` together to also confirm the key itself is
+ * valid, via /health's `authValid` field (see server/index.js).
+ * Never throws.
+ * @param {{ url: string, token?: string }} params
+ * @returns {Promise<{ reachable: boolean, ready: boolean, authValid: boolean|null, model: string|null, error: string|null }>}
+ */
+export async function testBackendConnection({ url, token }) {
+  const baseUrl = (url || '').trim().replace(/\/+$/, '');
+  if (!baseUrl) {
+    return { reachable: false, ready: false, authValid: null, model: null, error: 'No address entered.' };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/health`, { headers: authHeaders(token) }),
+      HEALTH_TIMEOUT_MS,
+      'Connection test timed out'
+    );
+    if (!response.ok) {
+      return { reachable: false, ready: false, authValid: null, model: null, error: `Server responded with ${response.status}.` };
+    }
+    const json = await response.json();
+    return {
+      reachable: true,
+      ready: json.status === 'ready',
+      authValid: typeof json.authValid === 'boolean' ? json.authValid : null,
+      model: json.model || null,
+      error: null,
+    };
+  } catch (err) {
+    return { reachable: false, ready: false, authValid: null, model: null, error: err?.message || 'Could not reach the VM.' };
+  }
+}
+
+/**
+ * Tests an OpenRouter key BEFORE it's saved to preferences - what Settings
+ * > Server Connection > OpenRouter API key's "Test & Save" calls. Requires
+ * the VM address to already be reachable, since the actual validation
+ * (server/index.js's /openrouter/key-status) happens by asking the VM to
+ * check the key against OpenRouter, not by calling OpenRouter directly
+ * from the phone.
+ * @returns {Promise<{valid: boolean|null, limit: number|null, limitRemaining: number|null, error: string|null}>}
+ */
+export async function testOpenRouterKey({ url, vmToken, openrouterKey }) {
+  const baseUrl = (url || '').trim().replace(/\/+$/, '');
+  const key = (openrouterKey || '').trim();
+  if (!baseUrl) {
+    return { valid: null, limit: null, limitRemaining: null, error: 'Set the VM address first.' };
+  }
+  if (!key) {
+    return { valid: null, limit: null, limitRemaining: null, error: 'No key entered.' };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/openrouter/key-status`, {
+        headers: { ...authHeadersRaw(vmToken), 'X-OpenRouter-Key': key },
+      }),
+      HEALTH_TIMEOUT_MS + 6000,
+      'OpenRouter key check timed out'
+    );
+    const json = await response.json().catch(() => null);
+    if (!json) {
+      return { valid: false, limit: null, limitRemaining: null, error: `Server responded with ${response.status}.` };
+    }
+    return {
+      valid: Boolean(json.valid),
+      limit: typeof json.limit === 'number' ? json.limit : null,
+      limitRemaining: typeof json.limitRemaining === 'number' ? json.limitRemaining : null,
+      error: json.error?.message || null,
+    };
+  } catch (err) {
+    return { valid: false, limit: null, limitRemaining: null, error: err?.message || 'Could not reach the VM.' };
+  }
+}
+
+// authHeaders() reads the OpenRouter key straight from preferences (see
+// its own comment above), which is exactly wrong for testOpenRouterKey()
+// above - that function's whole job is testing a key that ISN'T saved to
+// preferences yet. This is the same VM-auth-only header builder authHeaders()
+// used to be before the OpenRouter key was folded in.
+function authHeadersRaw(token) {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * Converts ZAO's internal message shape into plain {role, content}
+ * messages for the wire, passing already-OpenAI-shaped tool messages
+ * (role: 'tool', or an assistant message carrying tool_calls - see
+ * toolOrchestrator.js) through unchanged.
+ *
+ * `content` is left exactly as-is otherwise - it's usually a plain
+ * string, but chatStore.js's sendMessage() builds it as a multi-part
+ * array (`[{type:'text',...}, {type:'image_url'|'video_url',...}]`) for
+ * the current turn's message when there's an image/video attachment, now
+ * that Ox Alpha (via OpenRouter) actually has vision/video understanding
+ * - see chatStore.js's buildMultimodalContent(). `message.content || ''`
+ * only guards against a null/undefined content field; an array is
+ * truthy, so it passes through here untouched, exactly as OpenRouter's
+ * multimodal content-parts schema expects.
+ */
+function toBackendMessage(message) {
+  if (message.role === 'tool' || message.tool_calls) {
+    return message;
+  }
+  const role = message.role === 'system' ? 'system' : message.role === 'assistant' ? 'assistant' : 'user';
+  return { role, content: message.content || '' };
+}
+
+/**
+ * @param {Array} history - internal message format history
+ * @param {string} [modelKey] - kept for call-site compatibility with the old
+ *   multi-model signature; ignored, since there is only one model now.
+ * @param {object} options - { maxTokens, temperature, tools, toolChoice, onToken }
+ * @param {function} [options.onToken] - if provided (and no `tools` are requested -
+ *   see note below), the request streams via SSE (server/index.js's proxyToOpenRouter
+ *   already pipes OpenRouter's response through as-is, so this only needed the
+ *   client side wired up - see sseClient.js's header for why XHR, not fetch).
+ *   Called with the full accumulated content string after every chunk, so callers
+ *   can just do `setState(text)` rather than concatenating themselves. The
+ *   returned promise still resolves once at the end with the exact same
+ *   { success, data: { content, toolCalls, raw }, error } shape as the
+ *   non-streaming path, so this is purely additive - existing callers that don't
+ *   pass onToken are unaffected.
+ *   NOT used when `tools` are passed: Model Studio streams tool_calls as
+ *   incremental argument-string fragments (index/id/name/arguments split across
+ *   multiple deltas), a different accumulation problem than plain content text -
+ *   tool-calling callers (toolOrchestrator.js etc.) need the complete, parsed
+ *   tool_calls array anyway, not a token-by-token render, so they keep using the
+ *   plain non-streaming request below.
+ * @returns {Promise<{success, data: {content, toolCalls, raw}|null, error}>}
+ */
+export async function sendMessage(history, modelKey, options = {}) {
+  if (!Array.isArray(history) || history.length === 0) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Empty conversation history' } };
+  }
+
+  const { baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: ERROR_TYPES.NOT_CONFIGURED,
+        message: 'No VM address is set. Add it in Settings > Server Connection.',
+      },
+    };
+  }
+
+  const messages = history.map(toBackendMessage);
+
+  const body = {
+    messages,
+    max_tokens: options.maxTokens || 1024,
+    temperature: options.temperature ?? 0.7,
+  };
+
+  if (options.tools?.length) {
+    body.tools = options.tools;
+    body.tool_choice = options.toolChoice || 'auto';
+  }
+
+  const canStream = typeof options.onToken === 'function' && !body.tools;
+
+  if (canStream) {
+    return sendMessageStreaming(baseUrl, token, body, options.onToken);
+  }
+
+  return sendChatCompletionWithRetry(baseUrl, token, body);
+}
+
+// ---------------------------------------------------------------------------
+// 429 (rate limit) retry - added when the app moved to OpenRouter's free
+// `stealth/ox-alpha` preview model, which has real, tight rate limits
+// (unlike the old Alibaba Model Studio setup this never needed). A single
+// user turn can fire several model calls before a reply even starts
+// (intentClassifier.js, reasoningRouter.js's strategy classifier, THEN the
+// actual reasoning call) - without a retry, one 429 on any of those silently
+// degrades classification to 'general'/plain-chat (see intentClassifier.js's
+// own comment on why it degrades rather than guessing), which is exactly
+// what was cutting tool calls off before they ever got a chance to run.
+// Retrying the SAME call a couple of times, honoring OpenRouter's
+// Retry-After header when present, gives a transient rate-limit blip a real
+// chance to clear before the call gives up and degrades - same idea as
+// intentClassifier.js's own MAX_ATTEMPTS retry loop, just one layer lower
+// so every caller (classifier, router, reasoning, tool-calling) benefits
+// without each needing its own retry logic.
+// ---------------------------------------------------------------------------
+const RATE_LIMIT_MAX_RETRIES = 3;
+const RATE_LIMIT_BASE_DELAY_MS = 1500;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Reads Retry-After (seconds, or an HTTP-date) off a 429 response - falls back to exponential backoff if absent or unparseable. */
+function retryDelayMs(response, attempt) {
+  const header = response?.headers?.get?.('retry-after');
+  if (header) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    const dateMs = Date.parse(header);
+    if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+  }
+  return RATE_LIMIT_BASE_DELAY_MS * 2 ** (attempt - 1); // 1.5s, 3s, 6s
+}
+
+async function sendChatCompletionWithRetry(baseUrl, token, body) {
+  for (let attempt = 1; attempt <= RATE_LIMIT_MAX_RETRIES; attempt++) {
+    try {
+      const response = await withTimeout(
+        fetch(`${baseUrl}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+          body: JSON.stringify(body),
+        }),
+        COMPLETION_TIMEOUT_MS,
+        `Backend took longer than ${COMPLETION_TIMEOUT_MS / 1000}s to respond. Check that the server is still running on the VM.`
+      );
+
+      if (response.status === 429) {
+        if (attempt < RATE_LIMIT_MAX_RETRIES) {
+          await sleep(retryDelayMs(response, attempt));
+          continue;
+        }
+        return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: 'OpenRouter is rate-limiting Ox Alpha right now (HTTP 429) - this is common on the free/stealth preview tier under real usage. Try again in a moment, or check your rate-limit tier at openrouter.ai/keys.' } };
+      }
+
+      if (response.status === 401) {
+        return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token. Check it matches AUTH_TOKEN in the PC\'s server/config.js.' } };
+      }
+
+      if (response.status === 503) {
+        return { success: false, data: null, error: { type: ERROR_TYPES.MODEL_LOADING, message: 'The model is still loading on the backend. Try again in a moment.' } };
+      }
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `Backend returned an error (${response.status}): ${text.slice(0, 200)}` } };
+      }
+
+      const result = await response.json();
+      const choice = result?.choices?.[0];
+      const toolCalls = choice?.message?.tool_calls?.length ? choice.message.tool_calls : null;
+      const responseText = choice?.message?.content || null;
+
+      if (!responseText && !toolCalls) {
+        return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: 'No content from backend.', raw: result } };
+      }
+
+      return {
+        success: true,
+        data: { content: responseText, toolCalls, raw: result },
+        error: null,
+      };
+    } catch (err) {
+      console.error('[BackendClient] sendMessage failed:', err);
+      const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+      return {
+        success: false,
+        data: null,
+        error: {
+          type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+          message: isNetworkError
+            ? `Can't reach the ZAO backend. Make sure the server is running on the VM and the IP/API key in Settings > Server Connection are correct.`
+            : err?.message || 'Backend request failed.',
+        },
+      };
+    }
+  }
+  // Unreachable - the loop above always returns before falling through -
+  // but keeps the function's return type honest for any static analysis.
+  return { success: false, data: null, error: { type: ERROR_TYPES.UNKNOWN, message: 'Retry loop exhausted unexpectedly.' } };
+}
+
+/**
+ * The streaming half of sendMessage() above - split out because it needs a
+ * genuinely different transport (XHR via sseClient.js, not fetch) rather
+ * than just a different response-parsing branch. See sendMessage()'s
+ * onToken JSDoc for the contract; this resolves with the exact same
+ * { success, data, error } shape once the stream completes.
+ * @param {string} baseUrl
+ * @param {string|null} token
+ * @param {object} body - already built by sendMessage(), mutated here to set stream: true
+ * @param {(text: string) => void} onToken
+ */
+function sendMessageStreaming(baseUrl, token, body, onToken) {
+  return sendMessageStreamingAttempt(baseUrl, token, body, onToken, 1);
+}
+
+/**
+ * One attempt of the streaming call, retrying on a 429 the same way
+ * sendChatCompletionWithRetry() above does for the non-streaming path -
+ * see that function's header comment for why this matters now that the
+ * model is OpenRouter's rate-limited free `ox-alpha` preview. streamSSE
+ * surfaces a non-2xx status as onError with message `HTTP <code>` (see
+ * the 401/503 checks below, which already relied on this), so a 429 is
+ * detected the same way rather than needing streamSSE itself changed.
+ */
+function sendMessageStreamingAttempt(baseUrl, token, body, onToken, attempt) {
+  return new Promise((resolve) => {
+    let accumulated = '';
+    let lastRaw = null;
+    let sawAnyContent = false;
+
+    const { abort } = streamSSE({
+      url: `${baseUrl}/v1/chat/completions`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+      body: JSON.stringify({ ...body, stream: true }),
+      timeoutMs: COMPLETION_TIMEOUT_MS,
+      onEvent: (event) => {
+        lastRaw = event;
+        // Model Studio can emit a plain {error:{message}} frame instead of
+        // a normal delta if generation fails mid-stream (out of context,
+        // etc.) - surface it the same as a non-2xx response would.
+        if (event?.error) {
+          abort();
+          resolve({
+            success: false,
+            data: null,
+            error: { type: ERROR_TYPES.INFERENCE_ERROR, message: event.error.message || 'Backend returned an error mid-stream.', raw: event },
+          });
+          return;
+        }
+        const delta = event?.choices?.[0]?.delta?.content;
+        if (typeof delta === 'string' && delta.length > 0) {
+          accumulated += delta;
+          sawAnyContent = true;
+          onToken(accumulated);
+        }
+      },
+      onComplete: () => {
+        if (!sawAnyContent) {
+          resolve({ success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: 'No content from backend.', raw: lastRaw } });
+          return;
+        }
+        resolve({
+          success: true,
+          data: { content: accumulated, toolCalls: null, raw: lastRaw },
+          error: null,
+        });
+      },
+      onError: (err) => {
+        const msg = err?.message || '';
+        if (msg === 'HTTP 429') {
+          if (attempt < RATE_LIMIT_MAX_RETRIES && !sawAnyContent) {
+            sleep(RATE_LIMIT_BASE_DELAY_MS * 2 ** (attempt - 1)).then(() => {
+              resolve(sendMessageStreamingAttempt(baseUrl, token, body, onToken, attempt + 1));
+            });
+            return;
+          }
+          resolve({ success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: 'OpenRouter is rate-limiting Ox Alpha right now (HTTP 429) - this is common on the free/stealth preview tier under real usage. Try again in a moment, or check your rate-limit tier at openrouter.ai/keys.' } });
+          return;
+        }
+        console.error('[BackendClient] sendMessage (streaming) failed:', err);
+        if (msg === 'HTTP 401') {
+          resolve({ success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token. Check it matches AUTH_TOKEN in the PC\'s server/config.js.' } });
+          return;
+        }
+        if (msg === 'HTTP 503') {
+          resolve({ success: false, data: null, error: { type: ERROR_TYPES.MODEL_LOADING, message: 'The model is still loading on the backend. Try again in a moment.' } });
+          return;
+        }
+        const isNetworkError = msg.includes('Network request failed') || msg === 'TIMEOUT';
+        resolve({
+          success: false,
+          data: null,
+          error: {
+            type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+            message: isNetworkError
+              ? `Can't reach the ZAO backend. Make sure the server is running on the VM and the IP/API key in Settings > Server Connection are correct.`
+              : msg || 'Backend request failed.',
+          },
+        });
+      },
+    });
+  });
+}
+
+/**
+ * Runs a shell command on the PC via the backend's /terminal/run route.
+ * See src/services/terminal/pcTerminalTool.js for the tool-calling wrapper
+ * around this.
+ * @param {string} command
+ * @param {object} [options] - { cwd, timeoutMs }
+ * @returns {Promise<{success, data: {exitCode, timedOut, stdout, stderr}|null, error}>}
+ */
+export async function runTerminalCommand(command, options = {}) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/terminal/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({
+          command,
+          cwd: options.cwd,
+          timeoutMs: options.timeoutMs || TERMINAL_TIMEOUT_MS,
+          shell: options.shell || undefined,
+          hostAccess: options.hostAccess === true || undefined,
+          allowNetwork: options.allowNetwork === true || undefined,
+        }),
+      }),
+      (options.timeoutMs || TERMINAL_TIMEOUT_MS) + 10000, // small buffer over the server's own timeout
+      'Terminal command timed out waiting for a response.'
+    );
+
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `Terminal request failed (${response.status}): ${text.slice(0, 200)}` } };
+    }
+
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    console.error('[BackendClient] runTerminalCommand failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError
+          ? `Can't reach the ZAO backend to run the command.`
+          : err?.message || 'Terminal request failed.',
+      },
+    };
+  }
+}
+
+const PREVIEW_START_TIMEOUT_MS = 35 * 1000; // slightly over the server's own URL_DETECT_TIMEOUT_MS (30s)
+const PREVIEW_SCREENSHOT_TIMEOUT_MS = 20 * 1000; // networkidle wait (15s) plus settle buffer
+
+/**
+ * Starts a dev server (npm start, vite, python -m http.server, etc.) as a
+ * tracked background process on the PC and waits for its local URL to be
+ * detected (see server/devPreview.js) - or for URL_DETECT_TIMEOUT_MS to
+ * elapse, in which case the server is left running and reported as
+ * 'running_no_url_detected' rather than killed, since a slow/unrecognized
+ * startup isn't the same as a failed one.
+ * @param {string} command
+ * @param {object} [options] - { cwd, port }
+ * @returns {Promise<{success, data: {previewId, url, status, output, pid}|null, error}>}
+ */
+export async function startDevServer(command, options = {}) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/preview/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ command, cwd: options.cwd, port: options.port }),
+      }),
+      PREVIEW_START_TIMEOUT_MS,
+      'Dev server start timed out waiting for a response.'
+    );
+
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => null);
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: errBody?.error?.message || `Dev server start failed (${response.status}).` } };
+    }
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    console.error('[BackendClient] startDevServer failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError ? `Can't reach the ZAO backend to start the dev server.` : err?.message || 'Dev server start failed.',
+      },
+    };
+  }
+}
+
+/**
+ * Screenshots a rendered page - either a running dev server (by
+ * previewId) or any arbitrary URL - via the PC's shared Playwright
+ * Chromium instance (see server/devPreview.js's screenshotUrl(), reusing
+ * server/browserAgent.js's getBrowser()).
+ * @param {object} options - { previewId, url, fullPage, viewportWidth, viewportHeight }
+ * @returns {Promise<{success, data: {screenshotBase64, title, finalUrl, httpStatus, consoleErrors}|null, error}>}
+ */
+export async function screenshotDevPreview(options = {}) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/preview/screenshot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({
+          previewId: options.previewId,
+          url: options.url,
+          fullPage: options.fullPage === true || undefined,
+          viewportWidth: options.viewportWidth,
+          viewportHeight: options.viewportHeight,
+        }),
+      }),
+      PREVIEW_SCREENSHOT_TIMEOUT_MS,
+      'Dev preview screenshot timed out waiting for a response.'
+    );
+
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => null);
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: errBody?.error?.message || `Screenshot failed (${response.status}).` } };
+    }
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    console.error('[BackendClient] screenshotDevPreview failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError ? `Can't reach the ZAO backend to take the screenshot.` : err?.message || 'Screenshot failed.',
+      },
+    };
+  }
+}
+
+/**
+ * Stops a dev server previously started with startDevServer().
+ * @param {string} previewId
+ * @returns {Promise<{success, data: {success, alreadyStopped}|null, error}>}
+ */
+export async function stopDevServer(previewId) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/preview/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ previewId }),
+      }),
+      HEALTH_TIMEOUT_MS,
+      'Dev server stop timed out waiting for a response.'
+    );
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => null);
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: errBody?.error?.message || `Dev server stop failed (${response.status}).` } };
+    }
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    console.error('[BackendClient] stopDevServer failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError ? `Can't reach the ZAO backend to stop the dev server.` : err?.message || 'Dev server stop failed.',
+      },
+    };
+  }
+}
+
+/**
+ * Lists every dev preview server currently tracked on the PC via the
+ * backend's /preview/list route - the "what's actually still running"
+ * check for a previewId lost from context (same rationale as
+ * listPcProcesses() above for background processes).
+ * @returns {Promise<{success, data: {servers: Array<{previewId, command, cwd, url, status, startedAt}>}|null, error}>}
+ */
+export async function listDevPreviewServers() {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set.` } };
+  }
+  try {
+    const response = await withTimeout(fetch(`${baseUrl}/preview/list`, { headers: authHeaders(token) }), HEALTH_TIMEOUT_MS, 'Dev preview list fetch timed out.');
+    if (!response.ok) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `Failed to list dev preview servers (${response.status}).` } };
+    }
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? `Can't reach the ZAO backend.` : err?.message || 'Failed to list dev preview servers.' },
+    };
+  }
+}
+
+/**
+ * Starts a command as a tracked BACKGROUND process on the PC (via the
+ * backend's /process/start route) and returns immediately with an id -
+ * unlike runTerminalCommand, this never waits for the command to exit.
+ * This is what makes "run npm start" (or any dev server/watcher) usable
+ * instead of a guaranteed 2-minute timeout - see
+ * src/services/terminal/pcProcessTool.js for the tool-calling wrapper.
+ * @param {string} command
+ * @param {object} [options] - { cwd, shell }
+ * @returns {Promise<{success, data: {id, shellUsed}|null, error}>}
+ */
+export async function startPcProcess(command, options = {}) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/process/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ command, cwd: options.cwd, shell: options.shell || undefined }),
+      }),
+      HEALTH_TIMEOUT_MS + 6000, // starting a process is a quick spawn, not a wait-for-exit - short timeout is enough
+      'Starting the process timed out waiting for a response.'
+    );
+
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: body?.error?.message || `Failed to start process (${response.status}).` } };
+    }
+
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    console.error('[BackendClient] startPcProcess failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError ? `Can't reach the ZAO backend to start the process.` : err?.message || 'Failed to start process.',
+      },
+    };
+  }
+}
+
+/**
+ * Checks a background process's current status via /process/:id/status.
+ * @param {string} processId
+ * @returns {Promise<{success, data: {status, exitCode, signal, startedAt, finishedAt, pid}|null, error}>}
+ */
+export async function getPcProcessStatus(processId) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set.` } };
+  }
+  try {
+    const response = await withTimeout(fetch(`${baseUrl}/process/${processId}/status`, { headers: authHeaders(token) }), HEALTH_TIMEOUT_MS, 'Process status check timed out.');
+    if (response.status === 404) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'No process found with that id - it may have never started, or the PC backend has since restarted.' } };
+    }
+    if (!response.ok) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `Failed to get process status (${response.status}).` } };
+    }
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? `Can't reach the ZAO backend.` : err?.message || 'Failed to get process status.' },
+    };
+  }
+}
+
+/**
+ * Tails a background process's captured stdout/stderr via
+ * /process/:id/logs. Pass sinceIndex (from a previous call's
+ * nextIndex) to poll incrementally instead of re-fetching everything.
+ * @param {string} processId
+ * @param {object} [options] - { tail, sinceIndex }
+ * @returns {Promise<{success, data: {lines, nextIndex, status}|null, error}>}
+ */
+export async function getPcProcessLogs(processId, options = {}) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set.` } };
+  }
+  const params = new URLSearchParams();
+  if (options.tail) params.set('tail', String(options.tail));
+  if (options.sinceIndex !== undefined && options.sinceIndex !== null) params.set('sinceIndex', String(options.sinceIndex));
+  const query = params.toString() ? `?${params.toString()}` : '';
+
+  try {
+    const response = await withTimeout(fetch(`${baseUrl}/process/${processId}/logs${query}`, { headers: authHeaders(token) }), HEALTH_TIMEOUT_MS, 'Process log fetch timed out.');
+    if (response.status === 404) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'No process found with that id.' } };
+    }
+    if (!response.ok) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `Failed to get process logs (${response.status}).` } };
+    }
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? `Can't reach the ZAO backend.` : err?.message || 'Failed to get process logs.' },
+    };
+  }
+}
+
+/**
+ * Stops a background process via /process/:id/stop.
+ * @param {string} processId
+ * @param {object} [options] - { signal }
+ * @returns {Promise<{success, data: {stopped:boolean}|{alreadyStopped:boolean,status:string}|null, error}>}
+ */
+export async function stopPcProcess(processId, options = {}) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set.` } };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/process/${processId}/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ signal: options.signal || undefined }),
+      }),
+      HEALTH_TIMEOUT_MS + 6000,
+      'Stopping the process timed out waiting for a response.'
+    );
+    if (response.status === 404) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'No process found with that id.' } };
+    }
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: body?.error?.message || `Failed to stop process (${response.status}).` } };
+    }
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? `Can't reach the ZAO backend to stop the process.` : err?.message || 'Failed to stop process.' },
+    };
+  }
+}
+
+/**
+ * Lists every background process currently tracked on the PC (running or
+ * finished-but-not-yet-cleaned-up) via the backend's /process/list route.
+ * The "what's actually still running" check for when a process id from
+ * earlier in the conversation got lost (context truncation, a fresh
+ * conversation, app restart) - without this there was no way to
+ * rediscover a process started with startPcProcess() except by already
+ * knowing its id.
+ * @returns {Promise<{success, data: {processes: Array<{id, status, exitCode, signal, startedAt, finishedAt, pid, command, label}>}|null, error}>}
+ */
+export async function listPcProcesses() {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set.` } };
+  }
+  try {
+    const response = await withTimeout(fetch(`${baseUrl}/process/list`, { headers: authHeaders(token) }), HEALTH_TIMEOUT_MS, 'Process list fetch timed out.');
+    if (!response.ok) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `Failed to list processes (${response.status}).` } };
+    }
+    const result = await response.json();
+    return { success: true, data: result, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? `Can't reach the ZAO backend.` : err?.message || 'Failed to list processes.' },
+    };
+  }
+}
+
+/**
+ * Lists a folder on the PC via the backend's /pc-fs/list route - the
+ * "what did that npm install / build actually produce" step before
+ * pulling a specific file down with readPcFile(). Path is relative to
+ * server/config.js's PC_BRIDGE_ROOT.
+ * @param {string} [relativePath]
+ * @returns {Promise<{success, data: {path, entries: Array<{name, isDir, size}>}|null, error}>}
+ */
+export async function listPcDirectory(relativePath = '') {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/pc-fs/list?path=${encodeURIComponent(relativePath)}`, { headers: authHeaders(token) }),
+      HEALTH_TIMEOUT_MS,
+      'PC file listing timed out'
+    );
+    const json = await response.json().catch(() => null);
+    if (!response.ok) {
+      return { success: false, data: null, error: { message: json?.error?.message || `PC returned ${response.status}.` } };
+    }
+    return { success: true, data: json, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? "Can't reach the PC backend to list files." : err?.message || 'PC file listing failed.' },
+    };
+  }
+}
+
+/**
+ * Reads one file's bytes (base64) from the PC via the backend's
+ * /pc-fs/read route - how a build artifact (an APK, a bundle) that
+ * terminal_pc_run_command produced on the PC actually gets pulled onto
+ * the phone. Pair with filesystemTool.writeBinaryFileFromBase64() to
+ * save it into the phone's own SAF folder - see pcFilePullTool.js.
+ * @param {string} relativePath - relative to PC_BRIDGE_ROOT
+ * @returns {Promise<{success, data: {path, size, contentB64}|null, error}>}
+ */
+export async function readPcFile(relativePath) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/pc-fs/read?path=${encodeURIComponent(relativePath)}`, { headers: authHeaders(token) }),
+      TERMINAL_TIMEOUT_MS,
+      'PC file read timed out'
+    );
+    const json = await response.json().catch(() => null);
+    if (!response.ok) {
+      return { success: false, data: null, error: { message: json?.error?.message || `PC returned ${response.status}.` } };
+    }
+    return { success: true, data: json, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? "Can't reach the PC backend to read the file." : err?.message || 'PC file read failed.' },
+    };
+  }
+}
+
+/**
+ * Creates (or overwrites) one text file on the PC via /pc-fs/write -
+ * creates any missing parent folders along the way, so writing
+ * "myproject/src/App.js" works even before "myproject/src" exists. This
+ * is the primary way ZAO writes real project files now that development
+ * lives entirely on the PC - see pcFilesystemTool.js.
+ * @param {string} relativePath - relative to PC_BRIDGE_ROOT
+ * @param {string} content
+ * @param {{overwrite?: boolean}} [options]
+ * @returns {Promise<{success, data: {path, size, created}|null, error}>}
+ */
+export async function writePcFile(relativePath, content, options = {}) {
+  return postPcFilesJson('/pc-fs/write', { path: relativePath, content, overwrite: !!options.overwrite }, 'write the file');
+}
+
+/**
+ * Creates a folder (and any missing parent folders) on the PC via
+ * /pc-fs/mkdir - the usual first step of scaffolding a new project.
+ * @param {string} relativePath - relative to PC_BRIDGE_ROOT
+ * @returns {Promise<{success, data: {path}|null, error}>}
+ */
+export async function mkdirPc(relativePath) {
+  return postPcFilesJson('/pc-fs/mkdir', { path: relativePath }, 'create the folder');
+}
+
+/**
+ * Makes a precise, targeted change to one existing text file on the PC
+ * via /pc-fs/edit - oldString must match the file's current content
+ * exactly and uniquely (or replaceAll must be set), same contract as
+ * fs_edit_file's on-device version.
+ * @param {string} relativePath - relative to PC_BRIDGE_ROOT
+ * @param {string} oldString
+ * @param {string} newString
+ * @param {{replaceAll?: boolean}} [options]
+ * @returns {Promise<{success, data: {path, replacements, size}|null, error}>}
+ */
+export async function editPcFile(relativePath, oldString, newString, options = {}) {
+  return postPcFilesJson('/pc-fs/edit', { path: relativePath, oldString, newString, replaceAll: !!options.replaceAll }, 'edit the file');
+}
+
+/**
+ * Computes what a batch of proposed changes WOULD do across several
+ * files, without writing anything - the "diff preview before a risky
+ * multi-file edit" feature. Each entry is checked against the file's
+ * REAL current content on the PC, so a clean preview means the real
+ * changes will actually apply the same way.
+ * @param {Array<{path: string, type: 'edit'|'create'|'delete', oldString?: string, newString?: string}>} changes
+ * @returns {Promise<{success, data: {results, totalLinesAdded, totalLinesRemoved, fileCount, hasProblems}|null, error}>}
+ */
+export async function previewPcChanges(changes) {
+  return postPcFilesJson('/pc-fs/preview-changes', { changes }, 'preview the proposed changes');
+}
+
+/**
+ * Deletes a file, or a folder and everything in it, on the PC via
+ * /pc-fs/delete. No undo - same trust level as a terminal `rm`/`del`.
+ * @param {string} relativePath - relative to PC_BRIDGE_ROOT
+ * @returns {Promise<{success, data: {path, wasDirectory}|null, error}>}
+ */
+export async function deletePcEntry(relativePath) {
+  return postPcFilesJson('/pc-fs/delete', { path: relativePath }, 'delete the file/folder');
+}
+
+/**
+ * Renames a file or folder on the PC within its current parent
+ * directory, via /pc-fs/rename.
+ * @param {string} relativePath - relative to PC_BRIDGE_ROOT
+ * @param {string} newName - plain name, not a path
+ */
+export async function renamePcEntry(relativePath, newName) {
+  return postPcFilesJson('/pc-fs/rename', { path: relativePath, newName }, 'rename the file/folder');
+}
+
+/**
+ * Moves a file or folder on the PC into a different destination folder,
+ * via /pc-fs/move. Pass keepOriginal:true to copy instead of move.
+ * @param {string} sourcePath - relative to PC_BRIDGE_ROOT
+ * @param {string} destinationFolderPath - relative to PC_BRIDGE_ROOT ("" for the root itself)
+ * @param {{keepOriginal?: boolean}} [options]
+ */
+export async function movePcEntry(sourcePath, destinationFolderPath, options = {}) {
+  return postPcFilesJson('/pc-fs/move', { sourcePath, destinationFolderPath, keepOriginal: !!options.keepOriginal }, 'move the file/folder');
+}
+
+/**
+ * Creates (or, with overwrite:true, replaces) one binary file on the PC
+ * from base64 content, via /pc-fs/write-binary - the counterpart to
+ * writePcFile() for images/icons/generated assets that aren't UTF-8 text.
+ * @param {string} relativePath - relative to PC_BRIDGE_ROOT
+ * @param {string} contentB64
+ * @param {{overwrite?: boolean}} [options]
+ */
+export async function writeBinaryPcFile(relativePath, contentB64, options = {}) {
+  return postPcFilesJson('/pc-fs/write-binary', { path: relativePath, contentB64, overwrite: !!options.overwrite }, 'write the binary file');
+}
+
+/**
+ * Recursively zips a folder on the PC into a single .zip file, via
+ * /pc-fs/zip - the PC-side counterpart to filesystemTool.zipFolder()
+ * for packaging a finished project. Skips node_modules/.git/
+ * .zao-checkpoints automatically.
+ * @param {string} folderPath - relative to PC_BRIDGE_ROOT ("" for the project root)
+ * @param {string} zipOutputPath - relative to PC_BRIDGE_ROOT, e.g. "myproject.zip"
+ * @param {{overwrite?: boolean}} [options]
+ * @returns {Promise<{success, data: {folderPath, zipOutputPath, filesZipped, size}|null, error}>}
+ */
+export async function zipPc(folderPath, zipOutputPath, options = {}) {
+  return postPcFilesJson('/pc-fs/zip', { folderPath, zipOutputPath, overwrite: !!options.overwrite }, 'zip the folder');
+}
+
+/**
+ * Extracts a .zip file already on the PC into a destination folder, via
+ * /pc-fs/extract-zip - recreates the archive's internal folder
+ * structure. Handy for unpacking a downloaded template or starter
+ * project that terminal_pc_run_command pulled down (or that was written
+ * with writeBinaryPcFile()).
+ * @param {string} zipPath - relative to PC_BRIDGE_ROOT
+ * @param {string} destinationFolderPath - relative to PC_BRIDGE_ROOT ("" for the project root)
+ * @returns {Promise<{success, data: {zipPath, destinationFolderPath, filesExtracted}|null, error}>}
+ */
+export async function extractZipPc(zipPath, destinationFolderPath) {
+  return postPcFilesJson('/pc-fs/extract-zip', { zipPath, destinationFolderPath }, 'extract the ZIP file');
+}
+
+/**
+ * Literal substring search across text files on the PC, via /pc-fs/grep -
+ * finds where something is defined/used before deciding what to edit.
+ * @param {string} query
+ * @param {{path?: string, caseSensitive?: boolean, maxResults?: number}} [options]
+ */
+export async function grepPc(query, options = {}) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` } };
+  }
+  const params = new URLSearchParams({ query, path: options.path || '', maxResults: String(options.maxResults || 50) });
+  if (options.caseSensitive) params.set('caseSensitive', 'true');
+  return getPcFilesJson(`/pc-fs/grep?${params.toString()}`, 'search the project');
+}
+
+/**
+ * Finds files on the PC by name pattern (e.g. "**\/*.test.js"), via
+ * /pc-fs/glob. Supports *, **, ? - no brace expansion or character classes.
+ * @param {string} pattern
+ * @param {{path?: string}} [options]
+ */
+export async function globPc(pattern, options = {}) {
+  const params = new URLSearchParams({ pattern, path: options.path || '' });
+  return getPcFilesJson(`/pc-fs/glob?${params.toString()}`, 'find files');
+}
+
+/**
+ * Lists recent PC filesystem checkpoints (newest first) via
+ * /pc-fs/checkpoints - each one was recorded automatically right before
+ * a write/edit/delete/rename/move mutated something.
+ * @param {{limit?: number}} [options]
+ */
+export async function listPcCheckpoints(options = {}) {
+  const params = new URLSearchParams({ limit: String(options.limit || 20) });
+  return getPcFilesJson(`/pc-fs/checkpoints?${params.toString()}`, 'list checkpoints');
+}
+
+/**
+ * Restores whatever a PC filesystem checkpoint captured - the file's/
+ * folder's exact prior content, or removes what a create introduced.
+ * No redo. See /pc-fs/checkpoints/rewind in server/pcFiles.js.
+ * @param {string} checkpointId
+ */
+export async function rewindPcCheckpoint(checkpointId) {
+  return postPcFilesJson('/pc-fs/checkpoints/rewind', { checkpointId }, 'rewind the checkpoint');
+}
+
+/**
+ * Shared GET helper for the /pc-fs/* read-side routes (grep, glob,
+ * checkpoints list) - same connection resolution, auth, timeout, and
+ * error-shaping as postPcFilesJson() below, just for GET+querystring
+ * instead of POST+body.
+ */
+async function getPcFilesJson(routePathWithQuery, actionDescription) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` } };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}${routePathWithQuery}`, { headers: authHeaders(token) }),
+      TERMINAL_TIMEOUT_MS,
+      `PC ${actionDescription} timed out`
+    );
+    const json = await response.json().catch(() => null);
+    if (!response.ok) {
+      return { success: false, data: null, error: { message: json?.error?.message || `PC returned ${response.status}.` } };
+    }
+    return { success: true, data: json, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? `Can't reach the PC backend to ${actionDescription}.` : err?.message || `Failed to ${actionDescription}.` },
+    };
+  }
+}
+
+/**
+ * Shared POST helper for the /pc-fs/* write-side routes above - same
+ * connection resolution, auth, timeout, and error-shaping as
+ * listPcDirectory()/readPcFile(), just factored out since there are now
+ * four of these instead of one.
+ */
+async function postPcFilesJson(routePath, body, actionDescription) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}${routePath}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify(body),
+      }),
+      TERMINAL_TIMEOUT_MS,
+      `PC file ${actionDescription} timed out`
+    );
+    const json = await response.json().catch(() => null);
+    if (!response.ok) {
+      return { success: false, data: null, error: { message: json?.error?.message || `PC returned ${response.status}.` } };
+    }
+    return { success: true, data: json, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: isNetworkError ? `Can't reach the PC backend to ${actionDescription}.` : err?.message || `Failed to ${actionDescription}.` },
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PC git (server/pcGit.js) - execFile-based, no shell quoting involved.
+// `path` in every function below is a project folder relative to
+// PC_BRIDGE_ROOT, same convention as every other pc-* function above.
+// ---------------------------------------------------------------------------
+
+export async function gitInitPc(path) {
+  return postPcFilesJson('/pc-git/init', { path }, 'initialize the git repo');
+}
+export async function gitStatusPc(path) {
+  return getPcFilesJson(`/pc-git/status?path=${encodeURIComponent(path)}`, 'get git status');
+}
+export async function gitAddPc(path, options = {}) {
+  return postPcFilesJson('/pc-git/add', { path, files: options.files, all: options.all }, 'stage files');
+}
+export async function gitCommitPc(path, message, options = {}) {
+  return postPcFilesJson('/pc-git/commit', { path, message, authorName: options.authorName, authorEmail: options.authorEmail }, 'commit');
+}
+export async function gitPushPc(path, options = {}) {
+  return postPcFilesJson('/pc-git/push', { path, remote: options.remote, branch: options.branch, setUpstream: !!options.setUpstream, force: !!options.force }, 'push');
+}
+export async function gitPullPc(path, options = {}) {
+  return postPcFilesJson('/pc-git/pull', { path, remote: options.remote, branch: options.branch }, 'pull');
+}
+export async function gitCheckoutPc(path, branch, options = {}) {
+  return postPcFilesJson('/pc-git/checkout', { path, branch, create: !!options.create }, 'checkout the branch');
+}
+export async function gitRemoteAddPc(path, name, url) {
+  return postPcFilesJson('/pc-git/remote-add', { path, name, url }, 'add the remote');
+}
+export async function gitLogPc(path, options = {}) {
+  const params = new URLSearchParams({ path, limit: String(options.limit || 20) });
+  return getPcFilesJson(`/pc-git/log?${params.toString()}`, 'get git log');
+}
+export async function gitDiffPc(path, options = {}) {
+  const params = new URLSearchParams({ path, staged: options.staged ? 'true' : 'false' });
+  return getPcFilesJson(`/pc-git/diff?${params.toString()}`, 'get git diff');
+}
+
+// ---------------------------------------------------------------------------
+// PC zip/extract (server/pcZip.js)
+// ---------------------------------------------------------------------------
+
+export async function zipPcFolder(folderPath, zipPath) {
+  return postPcFilesJson('/pc-fs/zip', { folderPath, zipPath }, 'zip the folder');
+}
+export async function extractPcZip(zipPath, destinationFolderPath) {
+  return postPcFilesJson('/pc-fs/extract-zip', { zipPath, destinationFolderPath }, 'extract the zip');
+}
+
+
+/**
+ * Runs a live web search via the backend's /web/search route (DuckDuckGo
+ * HTML results, no API key - see server/webSearch.js). This is what backs
+ * both the "Web search" toggle in AttachmentSheet.js and the local coder
+ * model's web_search tool (src/services/search/webSearchTool.js).
+ * @param {string} query
+ * @param {number} [maxResults]
+ * @returns {Promise<{success, data: {query, results: Array<{title,url,snippet}>}|null, error}>}
+ */
+export async function runWebSearch(query, maxResults = 5) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/web/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ query, maxResults }),
+      }),
+      WEB_SEARCH_TIMEOUT_MS,
+      'Web search timed out waiting for a response.'
+    );
+
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `Search request failed (${response.status}): ${text.slice(0, 200)}` } };
+    }
+
+    const result = await response.json();
+    if (!result.success) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: result?.error?.message || 'Search returned no results.' } };
+    }
+
+    return { success: true, data: { query: result.query, results: result.results || [] }, error: null };
+  } catch (err) {
+    console.error('[BackendClient] runWebSearch failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError ? `Could not reach the VM backend for search.` : (err?.message || 'Web search failed.'),
+      },
+    };
+  }
+}
+
+/**
+ * Fetches a specific URL via the backend's /web/fetch route and returns
+ * its readable text content (see server/webFetch.js) - the companion to
+ * runWebSearch above: search finds candidate pages, this reads one of
+ * them (or any URL the person already has) in full.
+ * @param {string} url
+ * @returns {Promise<{success, data: {url, finalUrl, title, text, truncated}|null, error}>}
+ */
+export async function runWebFetch(url) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/web/fetch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ url }),
+      }),
+      WEB_FETCH_TIMEOUT_MS,
+      'Web fetch timed out waiting for a response.'
+    );
+
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok || !result.success) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: result?.error?.message || `Fetch request failed (${response.status}).` } };
+    }
+
+    return { success: true, data: { url: result.url, finalUrl: result.finalUrl, title: result.title, text: result.text, truncated: result.truncated }, error: null };
+  } catch (err) {
+    console.error('[BackendClient] runWebFetch failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError ? `Could not reach the VM backend for fetch.` : (err?.message || 'Web fetch failed.'),
+      },
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Background sessions (server/backgroundSessions.js) - start a long task on
+// the PC and let it keep running there after the phone app closes; come
+// back later and check on it. See src/services/session/backgroundSessionTool.js
+// for the tool-facing wrapper the local coder model actually calls.
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {string} prompt
+ * @returns {Promise<{success, data: {id, prompt, status, createdAt, updatedAt, stepCount, lastStep}|null, error}>}
+ */
+export async function startBackgroundSession(prompt) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` } };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/sessions/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ prompt }),
+      }),
+      SESSION_TIMEOUT_MS,
+      'Starting the background session timed out.'
+    );
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: result?.error?.message || `Could not start session (${response.status}).` } };
+    }
+    return { success: true, data: result.session, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return { success: false, data: null, error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: err?.message || 'Could not start session.' } };
+  }
+}
+
+/**
+ * @param {string} id
+ * @returns {Promise<{success, data: object|null, error}>} data is the full session record (status, log, answer, error) when found
+ */
+export async function getBackgroundSession(id) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set.` } };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/sessions/${encodeURIComponent(id)}`, { headers: { ...authHeaders(token) } }),
+      SESSION_TIMEOUT_MS,
+      'Checking the background session timed out.'
+    );
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: result?.error?.message || `Session not found (${response.status}).` } };
+    }
+    return { success: true, data: result.session, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return { success: false, data: null, error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: err?.message || 'Could not check session.' } };
+  }
+}
+
+/**
+ * @returns {Promise<{success, data: Array<object>|null, error}>} data is a list of session summaries, newest first
+ */
+export async function listBackgroundSessions() {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set.` } };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/sessions`, { headers: { ...authHeaders(token) } }),
+      SESSION_TIMEOUT_MS,
+      'Listing background sessions timed out.'
+    );
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: result?.error?.message || `Could not list sessions (${response.status}).` } };
+    }
+    return { success: true, data: result.sessions || [], error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return { success: false, data: null, error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: err?.message || 'Could not list sessions.' } };
+  }
+}
+
+/**
+ * @param {string} id
+ * @returns {Promise<{success, data: object|null, error}>}
+ */
+export async function stopBackgroundSession(id) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return { success: false, data: null, error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set.` } };
+  }
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/sessions/${encodeURIComponent(id)}/stop`, { method: 'POST', headers: { ...authHeaders(token) } }),
+      SESSION_TIMEOUT_MS,
+      'Stopping the background session timed out.'
+    );
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: result?.error?.message || `Could not stop session (${response.status}).` } };
+    }
+    return { success: true, data: result.session, error: null };
+  } catch (err) {
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return { success: false, data: null, error: { type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN, message: err?.message || 'Could not stop session.' } };
+  }
+}
+
+const OCR_TIMEOUT_MS = 3 * 60 * 1000; // scanned multi-page PDFs are slow on CPU; small buffer over the server's own OCR_TIMEOUT_MS
+
+/**
+ * Runs OCR on a scanned PDF or an image via the backend's /ocr/extract
+ * route (free/open-source Tesseract + PyMuPDF running in a Python
+ * subprocess on the PC - see server/ocr.js). Used by fileProcessor.js as
+ * a fallback when the local, pattern-matching PDF extractor
+ * (src/files/pdfExtractor.js) finds no text, and to pull any readable
+ * text out of a plain image attachment (there is no vision model in ZAO,
+ * so this is the only way image text reaches the model at all).
+ * @param {string} base64Data - raw file bytes, base64-encoded, no data-URI prefix
+ * @param {string} fileName - only the extension matters (routes .pdf vs. image handling server-side)
+ * @returns {Promise<{success, data: {text, pageCount, pagesProcessed}|null, error}>}
+ */
+export async function runOcrExtraction(base64Data, fileName) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/ocr/extract`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ fileBase64: base64Data, fileName }),
+      }),
+      OCR_TIMEOUT_MS,
+      'OCR timed out waiting for a response.'
+    );
+
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `OCR request failed (${response.status}): ${text.slice(0, 200)}` } };
+    }
+
+    const result = await response.json();
+    if (!result.success) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: result.error || 'OCR found no readable text.' } };
+    }
+
+    return {
+      success: true,
+      data: { text: result.text, pageCount: result.pageCount, pagesProcessed: result.pagesProcessed },
+      error: null,
+    };
+  } catch (err) {
+    console.error('[BackendClient] runOcrExtraction failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError
+          ? `Can't reach the ZAO backend to run OCR.`
+          : err?.message || 'OCR request failed.',
+      },
+    };
+  }
+}
+
+const DATA_ANALYSIS_TIMEOUT_MS = 3 * 60 * 1000; // large CSVs can be slow to load/groupby; small buffer over the server's own DATA_TIMEOUT_MS
+
+/**
+ * Runs pandas-based analysis on an existing CSV/XLSX file via the
+ * backend's /data/analyze route (Python subprocess on the PC - see
+ * server/data.js, scripts/data_analyze.py). Used by
+ * src/services/data/dataAnalysisTool.js as the model's data_analyze_file
+ * tool - describe/head/filter/groupby against real tabular data, the
+ * thing SheetJS (client-side, spreadsheet CREATION only) can't do.
+ * @param {string} base64Data - raw file bytes, base64-encoded, no data-URI prefix
+ * @param {string} fileName - extension matters (.csv/.tsv/.xlsx/.xls - routes which pandas reader is used server-side)
+ * @param {object} options - { operation: 'describe'|'head'|'filter'|'groupby', sheet, n, filter, groupby } - see data_analyze.py's header for the full shape
+ * @returns {Promise<{success, data: {shape, columns, dtypes, result}|null, error}>}
+ */
+export async function runDataAnalysis(base64Data, fileName, options = {}) {
+  const { mode, baseUrl, token } = getActiveConnection();
+  if (!baseUrl) {
+    return {
+      success: false,
+      data: null,
+      error: { type: ERROR_TYPES.NOT_CONFIGURED, message: `No VM address is set. Add it in Settings > Server Connection.` },
+    };
+  }
+
+  try {
+    const response = await withTimeout(
+      fetch(`${baseUrl}/data/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+        body: JSON.stringify({ fileBase64: base64Data, fileName, options }),
+      }),
+      DATA_ANALYSIS_TIMEOUT_MS,
+      'Data analysis timed out waiting for a response.'
+    );
+
+    if (response.status === 401) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.BAD_REQUEST, message: 'Backend rejected the auth token.' } };
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: `Data analysis request failed (${response.status}): ${text.slice(0, 200)}` } };
+    }
+
+    const result = await response.json();
+    if (!result.success) {
+      return { success: false, data: null, error: { type: ERROR_TYPES.INFERENCE_ERROR, message: result.error || 'Data analysis failed.' } };
+    }
+
+    return {
+      success: true,
+      data: { shape: result.shape, columns: result.columns, dtypes: result.dtypes, result: result.result },
+      error: null,
+    };
+  } catch (err) {
+    console.error('[BackendClient] runDataAnalysis failed:', err);
+    const isNetworkError = err?.message?.includes('Network request failed') || err?.message?.includes('timed out');
+    return {
+      success: false,
+      data: null,
+      error: {
+        type: isNetworkError ? ERROR_TYPES.BACKEND_UNREACHABLE : ERROR_TYPES.UNKNOWN,
+        message: isNetworkError
+          ? `Can't reach the ZAO backend to run data analysis.`
+          : err?.message || 'Data analysis request failed.',
+      },
+    };
+  }
+}
+
+export { ERROR_TYPES };

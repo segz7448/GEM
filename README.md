@@ -1,181 +1,345 @@
-# GEM Mobile
+# ZAO
 
-Expo/React Native app, entirely self-contained — no backend, no EAS
-Build/Submit, no Expo-hosted services. The app talks directly to
-`api.github.com` using an embedded token. As far as anyone using the
-compiled app is concerned, GEM builds it themselves; the GitHub layer
-only becomes visible to someone who decompiles the APK and reads the
-bundled JS.
+An Android chat app whose "brain" runs on a dedicated Alibaba Cloud VM,
+not the phone or a third-party cloud API. One model - **Ox Alpha**, an
+anonymous stealth-preview model served via OpenRouter and relayed through
+a small Node backend on the VM (`/server`) - handles chat, coding,
+reasoning, tool-calling, vision, and video understanding. The phone talks
+to the VM over its fixed public IP; the VM in turn talks to OpenRouter
+over HTTPS - there's no local model weights or GPU/CPU inference on the
+VM itself, and no Alibaba dependency left in the model-serving path (the
+VM's infrastructure is still hosted on Alibaba Cloud - that part hasn't
+changed). Beyond chat, ZAO acts as an on-device agent: it can browse the
+web (via a Playwright agent also running on the VM), push code to GitHub,
+run real shell commands on the VM, and create/read PDF/Word/Excel/
+PowerPoint files - all invoked automatically by the model deciding what a
+request needs, not through dedicated buttons.
 
-GEM uses the configured GitHub token for direct GitHub API access; build uploads and Actions runs use the selected build-target repository.
+**Vision and video understanding, no audio, no image generation.** Ox
+Alpha has real vision and video input - attached images and video are
+sent directly to the model, not just described via OCR (see "File
+handling" below for how OCR still supplements this). There's no
+speech-to-text, no text-to-speech, no voice mode, and no image generation
+anywhere in the app.
 
-## Configure the build target
+## The model
 
-Choose a GitHub repository with a base branch and GitHub Actions enabled. You can use this same GEM repository as the target. Each build pushes the selected project files and generated workflow to a temporary branch, builds an APK, downloads it, then deletes the temporary branch. If the target repo is public, those uploaded source files and the branch are visible to anyone until cleanup; GEM asks you to confirm each public build.
+| Model | Where it runs | Used for |
+|---|---|---|
+| **Ox Alpha** | OpenRouter, relayed via your VM | Everything: chat, coding, reasoning, tool-calling/routing, vision, video understanding |
 
-In GEM, open Settings → GitHub Build Target and enter the owner, repository name, and base branch. GEM stores these target fields in Android SecureStore and checks that the repository exists, the branch exists, and Actions are enabled before it starts.
+That's it - one model, no fallback chain, no task-based switching, no
+on-device weights on the phone. `src/config/localModels.js` keeps a single
+`MODEL_KEYS.OX_ALPHA` key purely so call sites that predate this
+(`toolOrchestrator.js`, `memoryEngine.js`) didn't need rewriting - the key
+itself is cosmetic; the backend only ever runs whatever `ZAO_MODEL_NAME`
+in `server/config.js` points to (currently `stealth/ox-alpha`).
 
-The app still needs a GitHub token configured as `GITHUB_TOKEN` under `expo.extra`:
+Ox Alpha is a free-preview stealth model as of writing - it's rate-limited
+by OpenRouter under real usage (`backendClient.js` retries a 429 a few
+times before giving up - see its `RATE_LIMIT_MAX_RETRIES` comment), and
+isn't guaranteed to stay free or available under this name indefinitely.
+If it's swapped for something else, `ZAO_MODEL_NAME` in
+`server/config.js` is the only thing that needs to change.
 
-```json
-"extra": {
-  "GITHUB_TOKEN": "<your GT_TOKEN>",
-  "GITHUB_OWNER": "<default owner for the Settings form>",
-  "GITHUB_REPO": "<default target; may be GEM>",
-  "GITHUB_BASE_BRANCH": "main"
-}
+## Architecture
+
+```
+App.js                         Screen state machine (chat/settings/plan/browserAgent),
+                              mounts the persistent BrowserAgentPiP + BrowserAgentStream
+                              connection, wires PlanScreen to planStore's actions.
+
+src/
+  db/database.js               SQLite layer. Every function returns {success, data, error},
+                              never throws. Source of truth for conversations, messages,
+                              preferences, memories, procedures, plans, usage log.
+  config/localModels.js        The one model key + classifyTask(), a keyword-based
+                              degraded fallback used only when the model-based
+                              classifier (intentClassifier.js) can't be reached.
+  services/
+    backend/backendClient.js    Talks to the Alibaba Cloud VM backend: sendMessage()
+                              (chat completions), runTerminalCommand() (VM terminal),
+                              runOcrExtraction() (OCR). Handles the VM's fixed IP
+                              connection and the model API key.
+    intentClassifier.js         Model-based router: classifies a message into
+                              github / browsing / general.
+    toolOrchestrator.js          Flat ReAct-style tool-calling loop: GitHub, filesystem,
+                              terminal, PDF, and Office (docx/xlsx/pptx/csv-create)
+                              tools, driven by real OpenAI-style tool_calls.
+    github/githubTool.js          Real GitHub REST/Git Data API calls (create repo,
+                              read/commit files, branches, PRs, releases) using the
+                              person's own Personal Access Token.
+    filesystem/filesystemTool.js  Device-wide file ops (create/move/rename/delete/zip/
+                              extract) under a folder granted once via Android's
+                              Storage Access Framework.
+    terminal/
+      pcTerminalTool.js           The full terminal, and the only one ZAO
+                                has - runs on the PC via the backend's
+                                /terminal/run.
+      terminalRouter.js            Gives the model live PC-reachability/internet
+                                status.
+      commandSafety.js             Hard-blocks catastrophic commands (rm -rf /, mkfs,
+                                fork bombs); gates destructive-but-legitimate ones
+                                (rm -rf, git push --force, DROP TABLE) behind an
+                                explicit confirmed:true the app doesn't set yet.
+    pdf/pdfTool.js                 Create/merge/split PDFs (pdf-lib).
+    office/{docxTool,xlsxTool,pptxTool}.js  Create Word/Excel/PowerPoint files.
+    brain/
+      frontendBrain.js             decideRoute(): combines intentClassifier.js with
+                                the free local shouldDecompose() heuristic to pick
+                                one of HIERARCHICAL_PLAN / TOOL_TASK / BROWSING / CHAT.
+      backendBrain.js              BRAIN_ROLES taxonomy + runHierarchicalPlan(),
+                                which drives planCoordinator/planExecutor for goals
+                                big enough to decompose.
+    reasoning/                    Chain-of-thought (default), tree-of-thought,
+                              self-reflection, deductive/inductive/abductive/
+                              analogical inference - see REASONING_ARCHITECTURE.md.
+    planning/                    8-module Strategic -> Project -> Task -> Execution
+                              planning system - see BRAIN_ARCHITECTURE.md.
+    memory/                      Working-memory compaction, semantic facts, procedural
+                              memory, lexical retrieval - see MEMORY_ARCHITECTURE.md.
+    browserAgent/                 Phone-side display/control for the PC-hosted
+                              Playwright browser agent (see server/browserAgent.js) -
+                              a WebSocket stream, not an on-device browser.
+    fileProcessor.js             Entry point for any attached file - routes to the
+                              right extractor, normalizes every result into one
+                              shape, falls back to server-side OCR when local PDF
+                              text extraction finds nothing.
+    textExtraction.js /
+    zipHandler.js                 On-device plain text/CSV extraction and ZIP
+                              unzipping (expo-file-system + papaparse / jszip).
+  files/
+    pdfExtractor.js               On-device, pattern-matching PDF text extraction -
+                              works on normal text-based PDFs; scanned/image-based
+                              PDFs fall through to fileProcessor.js's OCR fallback.
+    officeExtractors.js            On-device .docx text extraction (jszip).
+  utils/orchestrator.js           The one function the UI calls to send a message:
+                              frontendBrain.decideRoute() picks a path, then either
+                              runs reasoningEngine's runReasoningChat() (plain chat),
+                              toolOrchestrator (tool task), the browser agent, or
+                              backendBrain.runHierarchicalPlan(). Never throws.
+  store/
+    chatStore.js                   Zustand store: messages, conversations, sending
+                                state, attachment extraction, assembleHistory()
+                                (semantic facts -> retrieved snippets -> rolling
+                                summary -> raw recent turns, in that order).
+    planStore.js                    Wraps the planning system for PlanScreen.js.
+    preferencesStore.js              Theme, memory/browser-access toggles, backend
+                                connection settings, GitHub token status.
+  screens/
+    ChatScreen.js                    Main chat UI, ReasoningChip, "View Plan" chip.
+    PlanScreen.js / StepDetailSheet.js  Approve/reject steps, milestone strip,
+                                checkpoint bar, four-tier trace drill-down.
+    SettingsScreen.js                 Backend Connection, GitHub token, Memory,
+                                Browser Agent, Usage.
+    BrowserAgentScreen.js             Full-screen live browser agent view.
+  components/                     ErrorBoundary, SidebarDrawer, AttachmentSheet,
+                              MarkdownText, MessageActionMenu/Actions, Toast,
+                              ImageViewerModal.
+  theme/                        tokens.js (light+dark palettes) + useTheme.js.
+
+server/                        Alibaba Cloud VM backend (Node/Express) - see server/README.md.
+  index.js                       Relays /v1/chat/completions to
+                              OpenRouter, health check + internet-
+                              reachability self-check, rate limiting, auth.
+  terminal.js                    /terminal/run - real bash/Python execution.
+  ocr.js + scripts/ocr_extract.py  /ocr/extract - free, open-source OCR
+                              (Tesseract via pytesseract, PyMuPDF for PDF page
+                              rendering) in a Python subprocess.
+  browserAgent.js / browserStream.js  Playwright-driven browser agent + its
+                              WebSocket stream to the phone, including a
+                              needsHuman handoff for CAPTCHAs/2FA.
 ```
 
-The token must be able to read/write contents and run Actions in the selected target repository. Managing repository secrets needs the additional GitHub Actions secrets permission.
+For the deeper architectural picture (what "brain," "reasoning," and
+"memory" mean here and exactly what's wired vs. still a gap), see:
 
-**First build only:** GEM checks whether `.github/workflows/gem-android.yml`
-already exists on your base branch, and if not, registers it on the repository's *default branch*
-(`githubClient.ts` → `ensureWorkflowRegistered`) before dispatch. GitHub
-requires the workflow file on the default branch even when a build uses
-a different configured base branch, so the first build may add one
-workflow-registration commit to the default branch. After
-that it's a no-op check on every subsequent build.
+- `BRAIN_ARCHITECTURE.md` - dense/MoE/multi-brain/hybrid-symbolic taxonomy
+  and which files implement which.
+- `REASONING_ARCHITECTURE.md` - CoT/ToT/ReAct/self-reflection/inference-mode
+  taxonomy and routing.
+- `MEMORY_ARCHITECTURE.md` - working/episodic/semantic/procedural/retrieval
+  memory taxonomy and routing.
+- `SYSTEM_COMPONENTS.md` - routing, state management, feedback loop,
+  human-in-the-loop, and audit trail: what exists, what doesn't.
+- `HARDENING_NOTES.md` - security/reliability gaps and what's fixed.
 
-The UI uses one Material Community vector-icon set for navigation, project states, actions, and empty/error states. The custom 1024px launcher mark is a faceted violet-and-mint gem on a dark field.
+## Setup
 
-## How a build actually runs (`src/lib/buildPipeline.ts`)
+**VM backend** (relays chat to OpenRouter - see
+`server/README.md` for full detail):
+```
+cd server
+npm install
+# set ZAO_AUTH_TOKEN (env var, or edit config.js) to a real secret
+# get an OpenRouter key at openrouter.ai/keys - enter it in the app's
+# Settings > Server Connection > OpenRouter API key instead of here
+```
+Run `./start.sh` (or set it up as a systemd service - see that file's own
+header) each time before using the app - it starts the Node server, which
+relays requests straight to OpenRouter. The VM is 24/7, so once
+running there's nothing else to keep restarting.
 
-1. `expo-document-picker` → zip picked, immediately copied to durable
-   storage (`documentDirectory/pending-uploads/`) — this is the
-   checkpoint everything else resumes from
-2. `zipUtils.ts` (JSZip) extracts it in memory, Zip-Slip guarded
-3. `projectScanner.ts` reads manifests, package dependencies, Android
-   project structure and source markers to detect project type (native
-   Android, React Native, managed Expo, Flutter, Capacitor, Cordova) and
-   validates the configuration. It shows the evidence and issues before
-   build; it does not infer app features or review code behavior.
-   `iconExtractor.ts` extracts the app icon when recognizable
-4. `workflowGenerator.ts` produces `.github/workflows/gem-android.yml`
-5. The native foreground service starts here (see below) — the branch
-   create/push/dispatch sequence is the one part of the pipeline that
-   can't just be re-run from a cold start without risk of duplicating
-   a dispatched build
-6. `githubClient.ts` creates a throwaway branch (or reuses one from a
-   prior attempt), pushes every file via the Git Data API, dispatches
-   the workflow, and polls for the correlated run — checking first
-   whether a previous attempt's dispatch already landed before firing
-   another one
-7. Once a run id is confirmed, the foreground service stops and the
-   local upload copy is deleted — from here, ordinary background
-   polling is enough
-8. On success: downloads the artifact, extracts the APK (`zipUtils.ts`),
-   saves it to `expo-file-system`, deletes the GitHub artifact
-9. On failure: downloads run logs, `logParser.ts` turns them into a
-   structured, deduplicated report — no AI call needed
-10. The branch is always deleted once the run reaches a terminal state
-
-Every step from #1 onward is resumable — `resumePendingBuilds()` runs
-on app launch and from the background task, and re-enters this exact
-same pipeline function, which checks what already happened (branch
-exists? already dispatched? run already completed?) before repeating
-any step.
-
-`zustand` (`src/store/buildStore.ts`) holds the live in-memory stage
-while a build is running in the current session; `expo-sqlite`
-(`src/lib/db.ts`) is the persisted source of truth everything else
-reads from — history, the build detail screen, and the background task.
-
-## Expo components in use
-
-| Component | What it's used for |
-|---|---|
-| `expo-document-picker` | picking the project `.zip` |
-| `expo-file-system` | reading the upload, saving the finished APK + extracted app icon |
-| `jszip` | all zip extraction/creation, pure JS (no native zip module) |
-| `expo-sqlite` | build history + pipeline state (local-only, per spec) |
-| `expo-crypto` | generating each build's UUID |
-| `expo-notifications` | live-updating build-progress notification (same identifier reused per build) |
-| `expo-task-manager` + `expo-background-fetch` | resumes polling a dispatched run's status while the app is closed |
-| `expo-secure-store` | encrypted storage for user-supplied AI provider keys and the build-target repository selection |
-| `expo-sharing` / `expo-intent-launcher` | opening/sharing the finished APK |
-| `expo-router` | screens/navigation |
-
-## Native module: `modules/gem-foreground-service`
-
-Closes the last gap from checkpointing alone: the few seconds between
-copying an upload to disk and confirming GitHub dispatched a run. A
-real Android foreground service (`BuildKeepAliveService.kt`) holds the
-app process at foreground priority for exactly that window — it does
-no work itself, it just makes the OS much less likely to kill the
-process while `buildPipeline.ts` is mid push/dispatch. It's started
-right before the risky work begins and stopped the moment a run id is
-confirmed (`src/lib/buildKeepAlive.ts` / `buildPipeline.ts`); after
-that point, the checkpoint/resume logic alone is enough.
-
-**Requires a dev client, not Expo Go.** Custom native modules like
-this one only work in a build produced by `expo run:android` (which
-this project already uses) — Expo Go can't load them. If you're
-currently testing in Expo Go, that stops working the moment this
-module is added; you'll need `npx expo run:android` (or a
-same-shaped dev-client build) from here on.
-
-Local modules under `modules/` are autolinked automatically by Expo's
-tooling as of recent SDK versions — no extra config needed beyond
-what's already in `app.json`. If it doesn't get picked up, run
-`npx expo-modules-autolinking verify` to check discovery.
-
-## Building GEM itself
-
-`.github/workflows/build-gem.yml` builds this project into an APK via
-GitHub Actions — same idea as what this app does for other projects,
-just run once, manually, for GEM's own source. See "Signing a release
-build" below for the release-build half of it.
-
-The repository's own `build-gem.yml` workflow builds GEM itself. GEM's in-app builder can also use this repository as its target: it writes uploaded projects to temporary `build/{id}` branches, without overwriting the `main` source files. If the repo is public, those temporary source branches are public too, so GEM asks before uploading to a public target.
-
-## Signing a release build
-
-`build-gem.yml` always builds a debug APK. For an in-app Gradle release build, GEM uses the same four secrets to sign the APK and AAB when all are configured:
-
-| Secret | What it is |
-|---|---|
-| `RELEASE_KEYSTORE_BASE64` | your `.keystore`/`.jks` file, base64-encoded |
-| `RELEASE_STORE_PASSWORD` | keystore password |
-| `RELEASE_KEY_ALIAS` | key alias inside the keystore |
-| `RELEASE_KEY_PASSWORD` | password for that specific key |
-
-Flutter release signing is not yet wired to these secrets; its workflow can produce a release APK/AAB but may be unsigned.
-
-If you don't already have a keystore:
-
+**Phone app**:
 ```bash
-keytool -genkeypair -v -keystore release.keystore -alias gem-release \
-  -keyalg RSA -keysize 2048 -validity 10000
-base64 -w0 release.keystore > release.keystore.b64   # paste this file's contents as RELEASE_KEYSTORE_BASE64
+npm install
+npx expo start          # dev server, scan QR with Expo Go for quick iteration
+npx expo prebuild --platform android --clean   # generate native android/ project
 ```
+Then in **Settings > Server Connection**, enter the VM's IP (Test & Save),
+and the same value set for `ZAO_AUTH_TOKEN` in `server/config.js` as the
+Model API key (its own, separate Test & Save).
 
-Without those secrets, the release step is skipped entirely (a notice
-in the workflow run says so) rather than silently producing a
-debug-signed "release" APK — Expo's default generated project signs
-release builds with the debug keystore unless something overrides it,
-which is exactly what `plugins/withReleaseSigning.js` exists to fix.
+## Tool access (GitHub, filesystem, terminal)
 
-## Known limitations
-- **No true push notifications** — everything fires from in-app
-  polling or the background task. If the OS fully kills the
-  background task, nothing arrives until the app reopens.
-- **Android only** — iOS/Windows workflow templates aren't built yet.
-- **No AI-assisted failure analysis wired up yet** — Settings stores
-  and tests provider keys, but nothing sends a failed build's log to
-  them for an AI explanation; failures currently only get the
-  regex-based report from `logParser.ts`.
-- Resumable downloads and light/dark/system theming from the original
-  spec aren't built.
-- **Icon extraction has limits**: works for managed Expo (`app.json`'s
-  `expo.icon`) and native/bare-Android layouts (`mipmap-*/ic_launcher`
-  by convention). A project using `app.config.js`/`.ts` instead of
-  `app.json` won't resolve an icon (would need a JS evaluator, not a
-  JSON parse) — falls back to the placeholder icon in that case, same
-  as any project with no recognizable icon at all.
+None of these have dedicated buttons - ask in plain language, and
+`toolOrchestrator.js` (driven by the model) decides which tool(s) to call
+and shows a running checklist as it works.
 
-## `gem-backend/` (retired)
+- **GitHub** - add a Personal Access Token with `repo` scope in
+  **Settings**. Uses the REST/Git Data API (blob -> tree -> commit ->
+  update ref) since there's no `git` binary in the RN runtime.
+- **Filesystem** - grant a folder once via Android's system folder picker,
+  then the model can create/move/rename/delete/zip/extract files in it.
+  Every `.js`/`.jsx`/`.ts`/`.tsx`/`.json` write is syntax/JSX-checked with
+  a real parser (`syntaxCheck.js`) before it touches disk - a broken file
+  is refused instead of saved. `fs_check_syntax`/`fs_check_project_syntax`
+  check on demand; the same project-wide check also runs automatically
+  right before a terminal command that starts/builds a project
+  (`projectRunGate.js`), blocking the run if anything fails.
+- **Terminal** - the Alibaba Cloud VM backend (`terminal_pc_run_command`,
+  the only terminal ZAO has - see `terminalRouter.js`) auto-detects bash
+  or a raw Python interpreter per command, so `zip`/`unzip`/`tar` just
+  work as plain commands with no special-casing needed - in addition to
+  the JS-level zip handling already in `zipHandler.js` (for reading an
+  uploaded zip
+  attachment) and `filesystemTool.js` (`fs_zip`/`fs_extract_zip`, for the
+  model creating/extracting archives as part of a task).
 
-The earlier NestJS backend from this conversation is no longer part
-of the architecture — everything it did now runs on-device. Kept
-around only if you want to revisit a server-side design later (e.g.
-if the GitHub account this uses ever needs to hold anything else).
+## Browser agent
+
+The composer's globe icon toggles live web browsing. The browser itself
+runs on the PC via Playwright (`server/browserAgent.js`), streamed live to
+the phone over a WebSocket (`src/services/browserAgent/browserAgentStream.js`)
+- `BrowserAgentPiP.js`/`BrowserStreamView.js` render the live screenshot
+feed and let the person take over manually (CAPTCHAs, logins, 2FA) when
+the agent flags `needsHuman`. One `BrowserAgentStream` connection persists
+for the app's lifetime so a session's page/history survives across
+separate tasks in the same conversation.
+
+## File handling
+
+ZAO can read PDF, Word (.docx), ZIP archives, CSV, plain text/code files,
+and images attached via the "+" button - and separately, create new PDF/
+Word/Excel/PowerPoint/CSV files on request via the tool-calling path.
+
+- **CSV, plain text/code files** - extracted entirely on-device
+  (`textExtraction.js`) via `expo-file-system` + `papaparse`.
+- **ZIP archives** - unzipped entirely on-device (`jszip`, pure JS), capped
+  at 30 entries / ~60,000 combined characters so a huge archive can't hang
+  the app or blow out the model's context window.
+- **PDF** - `src/files/pdfExtractor.js` does on-device, pattern-matching
+  text extraction first (fast, no network, works on normal text-based
+  PDFs). When that finds nothing or flags a suspiciously low text-to-size
+  ratio (likely scanned/image-based), `fileProcessor.js` falls back to
+  real OCR on the PC backend (`server/ocr.js` - free, open-source
+  Tesseract + PyMuPDF, no cloud call).
+- **Word (.docx)** - on-device extraction (`officeExtractors.js`, jszip).
+- **.pptx reading** - not supported yet (creating a .pptx works; reading
+  one back would need dedicated slide-XML parsing that hasn't been built).
+- **Images** - there's no vision model, so the model can't see an attached
+  image. It still attaches and displays as a chat bubble, and
+  `fileProcessor.js` runs the same OCR path against it as a best-effort
+  fallback - a screenshot or photo of a document/whiteboard gets its text
+  extracted; a photo with no text just attaches with nothing extracted.
+  OCR setup (Python + Tesseract) is documented in `server/README.md`; if
+  it's not installed, images/scanned PDFs still attach fine, they just
+  won't have any text pulled out of them.
+- **Generating PDF/Word/Excel/PowerPoint files** - via the tool-calling
+  path, not a separate UI: describe what you want, and
+  `pdf_create`/`docx_create`/`xlsx_create`/`pptx_create` get called
+  automatically.
+
+## Key design decisions
+
+- **Single model, no fallback chain**: the model failing to load or
+  respond is a real, surfaceable error - there's no other provider to
+  silently retry.
+- **Nothing throws uncaught**: `db/database.js`, `backendClient.js`, and
+  every tool service wrap operations in try/catch and return a consistent
+  `{success, data, error}` shape. Combined with the top-level
+  `ErrorBoundary` in `App.js`, the app shouldn't show a blank crash
+  screen.
+- **Routing is understood, not pattern-matched**: `intentClassifier.js`
+  asks the model itself to understand what a message needs, rather than
+  scanning for exact hardcoded phrases. The old keyword list
+  (`classifyTask()` in `localModels.js`) still exists, but only as a
+  degraded fallback for when the classifier call itself can't be made.
+- **Icons: `@expo/vector-icons` only**, never emoji or favicon-style
+  glyphs - every icon is a proper icon component with explicit `size` and
+  `color` props from `useTheme()`.
+
+## Message actions (long-press menu)
+
+Long-pressing a message bubble opens a floating context menu
+(`src/components/MessageActionMenu.js`).
+
+- **User's own message**: Copy, Edit.
+- **Assistant message**: Copy, Regenerate, Like/Dislike (feedback is
+  stored per message but not yet read back anywhere - see
+  `SYSTEM_COMPONENTS.md`'s feedback-loop section).
+
+**Edit** (user messages only) pulls the message's text back into the
+composer; Save updates that row's content in place via
+`chatStore.editMessage()`, stamping `edited_at`. Editing does NOT re-send
+to the model or touch later messages - it's a correction to the
+historical record, not a new turn.
+
+## Theme & navigation
+
+Three-way theme preference - **Auto** (follows the phone's system
+setting), **Light**, or **Dark** - persisted to SQLite. Navigation is a
+hand-rolled sidebar drawer (`src/components/SidebarDrawer.js`), built on
+React Native's `Animated` + `PanResponder` only - deliberately not
+`react-navigation`, to avoid pulling in `react-native-gesture-handler` +
+`reanimated` as additional native dependencies.
+
+## Known gaps
+
+See `SYSTEM_COMPONENTS.md`'s "what still needs work" section and
+`HARDENING_NOTES.md`'s "still open" section for the current, maintained
+list - resumable plans on launch, live plan-progress handlers, a
+feedback-loop consumer, an `agent_actions` audit table, and terminal
+confirmation UI are the main ones. `.pptx` reading (not writing) is also
+not built yet (see "File handling" above).
+
+## Testing
+
+`npm test` runs the Jest suite (`jest-expo` preset). Coverage right now
+is deliberately focused on the highest-blast-radius, pure-logic pieces
+of the state machine - the modules a silent bug in would be hardest to
+notice and most costly to ship:
+
+- `src/services/terminal/__tests__/commandSafety.test.js` - the
+  HARD_BLOCKED / RISKY / safe tiers both terminal tools gate every raw
+  command through.
+- `src/services/execution/__tests__/permissionModes.test.js` - the
+  five permission modes' allow/confirm/refuse decisions for every tool
+  category (read, write, destructive, terminal).
+- `src/services/planning/__tests__/planExecutor.test.js` -
+  `computeReadySteps()`, the dependency-scheduling core of the
+  hierarchical plan executor (single deps, fan-in deps, blocked
+  propagation).
+
+`.github/workflows/ci.yml` runs this suite on every push/PR to `main`.
+
+**First-time setup note:** this project is on Expo SDK 57 /
+`react-native@0.86.0`, which currently hits a known upstream
+`jest-expo`/`react-native` peer-dependency conflict
+([expo/expo#47435](https://github.com/expo/expo/issues/47435)) that
+makes a plain `npm install` fail with `ERESOLVE`. The `overrides` entry
+already in `package.json` (`"@react-native/jest-preset": "0.86.0"`) is
+the documented workaround - run `npm install` once locally after
+pulling this change so `package-lock.json` picks it up and gets
+committed; CI installs from that updated lockfile from then on.
+
