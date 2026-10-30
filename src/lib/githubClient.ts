@@ -239,13 +239,18 @@ export interface DispatchedRun {
   status: string;
 }
 
-export async function findDispatchedRun(workflowFile: string, branchName: string, sinceIso: string): Promise<DispatchedRun | null> {
+export async function findDispatchedRun(workflowFile: string, branchName: string, _sinceIso: string): Promise<DispatchedRun | null> {
   const data = await gh<{ workflow_runs: { id: number; html_url: string; status: string; created_at: string }[] }>(
     `${await repositoryPath()}/actions/workflows/${workflowFile}/runs?branch=${branchName}&per_page=5`,
   );
-  const candidates = data.workflow_runs.filter((r) => new Date(r.created_at) >= new Date(sinceIso));
-  if (candidates.length === 0) return null;
-  const run = candidates.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+  // The build branch is unique per build (`build/<uuid>`), so any run on it
+  // belongs to this build. Filtering by created_at against the DEVICE clock
+  // (the old behavior) breaks discovery whenever the phone's clock is even a
+  // few seconds ahead of GitHub's: the run's server-side created_at then
+  // precedes sinceIso forever and the poll times out with "Timed out waiting
+  // for the dispatched workflow run to appear." even though the run exists.
+  if (data.workflow_runs.length === 0) return null;
+  const run = [...data.workflow_runs].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
   return { runId: run.id, htmlUrl: run.html_url, status: run.status };
 }
 
