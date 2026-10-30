@@ -96,8 +96,7 @@ function GithubTokenRow() {
 
   const save = async () => {
     if (!token.trim()) {
-      await clearGithubToken();
-      setResult('Cleared.');
+      setResult('Paste a GitHub token first.');
       return;
     }
     try {
@@ -106,6 +105,12 @@ function GithubTokenRow() {
     } catch (err: any) {
       setResult(err?.message ?? 'Could not save the token.');
     }
+  };
+
+  const clear = async () => {
+    await clearGithubToken();
+    setToken('');
+    setResult('Cleared.');
   };
 
   const test = async () => {
@@ -138,8 +143,11 @@ function GithubTokenRow() {
         <Pressable onPress={save} className="bg-accent rounded-xl px-4 py-2 mr-3">
           <View className="flex-row items-center"><Icon name="content-save-outline" size={16} color="#fff" style={{ marginRight: 6 }} /><Text className="text-white font-medium">Save</Text></View>
         </Pressable>
-        <Pressable onPress={test} disabled={!token.trim() || testing} className="bg-base border border-gray-600 rounded-xl px-4 py-2">
+        <Pressable onPress={test} disabled={!token.trim() || testing} className="bg-base border border-gray-600 rounded-xl px-4 py-2 mr-3">
           {testing ? <ActivityIndicator size="small" color="#fff" /> : <View className="flex-row items-center"><Icon name="connection" size={16} color="#fff" style={{ marginRight: 6 }} /><Text className="text-white">Test</Text></View>}
+        </Pressable>
+        <Pressable onPress={clear} className="bg-base border border-danger rounded-xl px-4 py-2">
+          <View className="flex-row items-center"><Icon name="delete-outline" size={16} color="#F87171" style={{ marginRight: 6 }} /><Text className="text-danger">Clear</Text></View>
         </Pressable>
       </View>
       {result && <View className="flex-row items-center mt-2"><Icon name={/saved|cleared|connected/i.test(result) ? 'check-circle-outline' : 'alert-circle-outline'} size={16} color={/saved|cleared|connected/i.test(result) ? '#4ADE80' : '#FBBF24'} style={{ marginRight: 6 }} /><Text className="text-gray-400 text-sm flex-1">{result}</Text></View>}
